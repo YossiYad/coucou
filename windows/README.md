@@ -185,6 +185,11 @@ npm install
 # A container has no FUSE for linuxdeploy, and its `strip` is older than
 # Fedora's libraries: these two keep the AppImage step happy.
 export APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=1
+# linuxdeploy's GStreamer plugin only looks in Debian's library paths. On
+# Fedora-based distributions, and others that keep libraries in /usr/lib64,
+# point it at the right ones or the AppImage step fails.
+export GSTREAMER_PLUGINS_DIR=/usr/lib64/gstreamer-1.0 \
+       GSTREAMER_HELPERS_DIR=/usr/libexec/gstreamer-1.0
 npm run pack           # → release/Coucou-Linux-X.Y.Z-x86_64.AppImage, .rpm, .deb
 ```
 
