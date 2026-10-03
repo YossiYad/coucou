@@ -59,7 +59,13 @@ struct OverviewView: View {
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                     .layoutPriority(1)
-                                Text(agent.source == .claudeCode ? "Claude Code" : "n8n")
+                                Text({ () -> String in
+                                    switch agent.source {
+                                    case .claudeCode: return "Claude Code"
+                                    case .agent:      return "Agent"
+                                    case .n8n:        return "n8n"
+                                    }
+                                }())
                                     .font(.system(size: 11))
                                     .foregroundColor(Color(hex: "#8E939C"))
                                     .lineLimit(1)
@@ -633,13 +639,10 @@ struct MailView: View {
         }
         guard let httpBody = try? JSONSerialization.data(withJSONObject: payload) else { return false }
         request.httpBody = httpBody
-        guard let (data, response) = try? await URLSession.shared.data(for: request) else { return false }
+        guard let (_, response) = try? await URLSession.shared.data(for: request) else { return false }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         if code == 200 || code == 201 { return true }
-        // Surface Resend error body for debugging
-        if let body = String(data: data, encoding: .utf8) {
-            print("[Resend] HTTP \(code): \(body)")
-        }
+        print("[Resend] HTTP \(code)")
         return false
     }
 
@@ -911,11 +914,14 @@ struct ResultView: View {
                     }
 
                     HStack(spacing: 8) {
+                        // The URL comes from the model, which may have read attacker-controlled
+                        // files or pages: only plain web links may leave the app.
+                        let openURL = safeWebURL(result.items.first?.url)
                         PrimaryButton("Open") {
-                            if let urlStr = result.items.first?.url, let url = URL(string: urlStr) {
-                                NSWorkspace.shared.open(url)
-                            }
+                            if let openURL { NSWorkspace.shared.open(openURL) }
                         }
+                        .disabled(openURL == nil)
+                        .help(openURL?.absoluteString ?? "")
                         SecondaryButton("Copy") {
                             let text = result.items.map { "\($0.label): \($0.detail)" }.joined(separator: "\n")
                             NSPasteboard.general.clearContents()
@@ -1959,7 +1965,7 @@ struct NotionCardView: View {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(appState.notionPages.prefix(3)) { page in
                     Button {
-                        if let url = URL(string: page.url) { NSWorkspace.shared.open(url) }
+                        if let url = safeWebURL(page.url) { NSWorkspace.shared.open(url) }
                     } label: {
                         HStack(spacing: 6) {
                             if let emoji = page.emoji {
