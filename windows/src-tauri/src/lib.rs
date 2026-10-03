@@ -1,11 +1,18 @@
 // Coucou for Windows and Linux — app wiring and the commands the island calls.
 
+mod ai;
 mod claude;
 mod clock;
+mod extract;
 mod files;
+mod gemini;
 mod hooks;
 mod integrations;
 mod island;
+mod local_llm;
+mod local_server;
+mod openai;
+mod tools;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -28,7 +35,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
-use claude::{Chat, ChatContext, ChatReply};
+use ai::{Chat, ChatContext, ChatReply, ModelInfo};
 use files::DroppedFile;
 use hooks::{HookPreview, HookStatus};
 use island::{PollGate, ScreenInfo};
@@ -293,13 +300,32 @@ fn approval_decline(app: AppHandle, request_id: String) {
 /// One chat turn. The API key and any file bytes stay on the Rust side.
 #[tauri::command]
 async fn chat_send(
+    app: AppHandle,
     shared: State<'_, Shared>,
     chat: State<'_, Chat>,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let settings = shared.settings.lock().unwrap().clone();
+    ai::send(&app, &chat, &settings, query, context).await
+}
+
+/// Allow / Deny on a change the model wants to make to a file.
+#[tauri::command]
+fn tool_decision(app: AppHandle, id: u64, allow: bool) {
+    tools::decide(&app, id, allow);
+}
+
+/// The models a provider offers, asked from the provider with the stored key.
+/// `start` lets an explicit Refresh wake a local server that is off.
+#[tauri::command]
+async fn ai_models(
+    shared: State<'_, Shared>,
+    provider: String,
+    start: Option<bool>,
+) -> Result<Vec<ModelInfo>, String> {
+    let settings = shared.settings.lock().unwrap().clone();
+    ai::models(ai::Provider::parse(&provider), &settings, start.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -433,6 +459,7 @@ pub fn run() {
         })
         .manage(Pending::default())
         .manage(Chat::default())
+        .manage(tools::Approvals::default())
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,
@@ -452,6 +479,8 @@ pub fn run() {
             log_line,
             chat_send,
             chat_reset,
+            ai_models,
+            tool_decision,
             ingest_file,
             secret_present,
             secret_set,

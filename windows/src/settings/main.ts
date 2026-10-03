@@ -3,8 +3,8 @@
 // integrations land here too in a later stage.
 
 import "./settings.css";
-import { Bridge, onEvent, type HookStatus } from "../core/bridge";
-import { DEFAULT_SETTINGS, type Settings } from "../core/state";
+import { Bridge, onEvent, type HookStatus, type ModelInfo } from "../core/bridge";
+import { DEFAULT_SETTINGS, type Provider, type Settings } from "../core/state";
 import { h, clear } from "../views/dom";
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
@@ -178,85 +178,296 @@ function claudeSection(status: HookStatus): HTMLElement {
   return section;
 }
 
-// ── Claude API section ────────────────────────────────────────────────────────
+// ── AI chat section ───────────────────────────────────────────────────────────
 
-const MODELS: [string, string][] = [
-  ["claude-opus-5", "Claude Opus 5"],
-  ["claude-sonnet-5", "Claude Sonnet 5"],
-  ["claude-haiku-4-5", "Claude Haiku 4.5"],
+interface ProviderDef {
+  id: Provider;
+  name: string;
+  /** Key-store entry, or null for the local server, which needs none. */
+  key: string | null;
+  placeholder: string;
+  hint: string;
+}
+
+const PROVIDERS: ProviderDef[] = [
+  {
+    id: "anthropic", name: "Claude (Anthropic)", key: "anthropic-api-key",
+    placeholder: "sk-ant-...", hint: "Searches the web, reads PDFs and images.",
+  },
+  {
+    id: "openai", name: "ChatGPT (OpenAI)", key: "openai-api-key",
+    placeholder: "sk-...", hint: "Searches the web, reads PDFs and images.",
+  },
+  {
+    id: "gemini", name: "Gemini (Google)", key: "gemini-api-key",
+    placeholder: "AIza...", hint: "Searches with Google, reads PDFs and images.",
+  },
+  {
+    id: "local", name: "Local model (Ollama, LM Studio...)", key: null, placeholder: "",
+    hint: "Runs on this computer, nothing leaves it. No web search or PDFs; images need a vision model.",
+  },
 ];
 
-function apiSection(hasKey: boolean): HTMLElement {
-  const dot = statusDot(hasKey);
-  const state = h("span", { class: "hint", text: hasKey ? `Key saved in ${keyStore}.` : "No key yet — the chat needs one." });
+/** Offered for Claude before a key is saved, when the live list can't be asked for. */
+const CLAUDE_MODELS: ModelInfo[] = [
+  { id: "claude-opus-5", label: "Claude Opus 5" },
+  { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
+  { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
+];
 
-  const field = h("input", {
-    type: "password",
-    placeholder: hasKey ? "••••••••••••  (stored)" : "sk-ant-...",
-    style: "flex:1 1 auto;min-width:0",
-    autocomplete: "off",
-    spellcheck: "false",
-  }) as HTMLInputElement;
+const OTHER_MODEL = "__other__";
 
-  const saveBtn = h("button", { class: "primary", text: "Save key" });
-  const clearBtn = h("button", { class: "danger", text: "Remove" });
+function modelOf(p: Provider): string {
+  switch (p) {
+    case "openai": return settings.openaiModel;
+    case "gemini": return settings.geminiModel;
+    case "local": return settings.localModel;
+    default: return settings.model;
+  }
+}
+
+function setModelOf(p: Provider, id: string) {
+  switch (p) {
+    case "openai": settings.openaiModel = id; break;
+    case "gemini": settings.geminiModel = id; break;
+    case "local": settings.localModel = id; break;
+    default: settings.model = id;
+  }
+}
+
+function aiSection(): HTMLElement {
+  const dot = statusDot(false);
+  const state = h("span", { class: "hint" });
   const feedback = h("div", {});
+  const grow = "flex:1 1 auto;min-width:0";
 
-  async function refresh() {
-    const present = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
-    dot.style.background = present ? "#22c55e" : "#f4505e";
-    state.textContent = present
-      ? `Key saved in ${keyStore}.`
-      : "No key yet — the chat needs one.";
-    field.placeholder = present ? "••••••••••••  (stored)" : "sk-ant-...";
-    clearBtn.style.display = present ? "" : "none";
-  }
+  const provider = h("select", {}) as HTMLSelectElement;
+  for (const p of PROVIDERS) provider.append(h("option", { value: p.id, text: p.name }));
+  provider.value = settings.provider;
 
-  saveBtn.addEventListener("click", async () => {
-    const value = field.value.trim();
-    if (!value) return;
-    clear(feedback);
-    try {
-      await Bridge.secretSet("anthropic-api-key", value);
-      field.value = "";
-      feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
-      await refresh();
-    } catch (err) {
-      feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
-    }
+  const keyField = h("input", {
+    type: "password", style: grow, autocomplete: "off", spellcheck: "false",
+  }) as HTMLInputElement;
+  const saveKey = h("button", { class: "primary", text: "Save key" });
+  const clearKey = h("button", { class: "danger", text: "Remove" });
+  const keyRow = h("div", { class: "row" }, h("label", { text: "API key" }), keyField, saveKey, clearKey);
+
+  const urlField = h("input", {
+    type: "text", style: grow, spellcheck: "false", placeholder: "http://localhost:11434",
+  }) as HTMLInputElement;
+  const connect = h("button", { class: "primary", text: "Connect" });
+  const urlRow = h("div", { class: "row" }, h("label", { text: "Server" }), urlField, connect);
+
+  const startField = h("input", {
+    type: "text", style: grow, spellcheck: "false", placeholder: "podman start ollama",
+  }) as HTMLInputElement;
+  const stopField = h("input", {
+    type: "text", style: grow, spellcheck: "false", placeholder: "podman stop ollama",
+  }) as HTMLInputElement;
+  const lifecycle = h(
+    "div",
+    {},
+    h("div", { class: "row" }, h("label", { text: "Start with" }), startField),
+    h("div", { class: "row" }, h("label", { text: "Stop with" }), stopField),
+    h("div", {
+      class: "hint",
+      text: "Optional. Coucou starts the server when a question finds it down, and stops it 10 minutes after the last one, so it takes no memory between uses. A server you started yourself is left alone.",
+    }),
+  );
+  const toolsToggle = toggle(settings.toolsEnabled, (on) => {
+    settings.toolsEnabled = on;
+    void save();
   });
+  lifecycle.append(
+    h("div", { class: "row" }, h("label", { text: "Let it act" }), toolsToggle),
+    h("div", {
+      class: "hint",
+      text: "Find, read and create files in your home folder, read web pages and search the web (through DuckDuckGo). Hidden files stay off limits, and nothing is written until you click Allow. Needs a model that can use tools, such as qwen3; others just chat.",
+    }),
+  );
 
-  clearBtn.addEventListener("click", async () => {
-    clear(feedback);
-    try {
-      await Bridge.secretClear("anthropic-api-key");
-      feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
-      await refresh();
-    } catch (err) {
-      feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
-    }
+  startField.addEventListener("change", () => {
+    settings.localStartCommand = startField.value.trim();
+    void save();
   });
-
-  const model = h("select", {}) as HTMLSelectElement;
-  for (const [id, label] of MODELS) model.append(h("option", { value: id, text: label }));
-  if (!MODELS.some(([id]) => id === settings.model)) {
-    model.append(h("option", { value: settings.model, text: settings.model }));
-  }
-  model.value = settings.model;
-  model.addEventListener("change", () => {
-    settings.model = model.value;
+  stopField.addEventListener("change", () => {
+    settings.localStopCommand = stopField.value.trim();
     void save();
   });
 
-  clearBtn.style.display = hasKey ? "" : "none";
+  const model = h("select", { style: grow }) as HTMLSelectElement;
+  const refresh = h("button", { text: "Refresh" });
+  const custom = h("input", {
+    type: "text", style: grow, spellcheck: "false", placeholder: "Model name, as the provider writes it",
+  }) as HTMLInputElement;
+  const useCustom = h("button", { text: "Use" });
+  const customRow = h("div", { class: "row" }, h("label", { text: "" }), custom, useCustom);
+
+  const onHide = h("select", {}) as HTMLSelectElement;
+  onHide.append(
+    h("option", { value: "keep", text: "Keep the conversation" }),
+    h("option", { value: "clear", text: "Start a new one" }),
+  );
+  onHide.value = settings.clearChatOnHide ? "clear" : "keep";
+  onHide.addEventListener("change", () => {
+    settings.clearChatOnHide = onHide.value === "clear";
+    void save();
+  });
+
+  const current = () => PROVIDERS.find((p) => p.id === provider.value) ?? PROVIDERS[0];
+
+  function note(kind: "ok" | "err", text: string) {
+    clear(feedback);
+    feedback.append(h("div", { class: `notice ${kind}`, text }));
+  }
+
+  function fillModels(list: ModelInfo[]) {
+    const p = current().id;
+    if (!modelOf(p) && list.length) {
+      setModelOf(p, list[0].id);
+      void save();
+    }
+    const chosen = modelOf(p);
+    clear(model);
+    for (const m of list) {
+      model.append(h("option", { value: m.id, text: m.label === m.id ? m.id : `${m.label}  (${m.id})` }));
+    }
+    if (chosen && !list.some((m) => m.id === chosen)) model.append(h("option", { value: chosen, text: chosen }));
+    model.append(h("option", { value: OTHER_MODEL, text: "Other…" }));
+    model.value = chosen || OTHER_MODEL;
+    customRow.style.display = model.value === OTHER_MODEL ? "" : "none";
+  }
+
+  /** `start`: an explicit Refresh or Connect may wake a local server that is off. */
+  async function loadModels(start = false) {
+    const p = current();
+    if (p.key) {
+      const present = (await Bridge.secretPresent(p.key)) ?? false;
+      clearKey.style.display = present ? "" : "none";
+      keyField.placeholder = present ? "••••••••••••  (stored)" : p.placeholder;
+      if (!present) {
+        dot.style.background = "#f4505e";
+        state.textContent = `No key yet, the chat needs one. ${p.hint}`;
+        fillModels(p.id === "anthropic" ? CLAUDE_MODELS : []);
+        return;
+      }
+      state.textContent = `Key saved in ${keyStore}. ${p.hint}`;
+    } else {
+      state.textContent = p.hint;
+    }
+    try {
+      const list = await Bridge.aiModels(p.id, start);
+      if (current() !== p) return; // the provider changed while this loaded
+      fillModels(list);
+      dot.style.background = list.length ? "#22c55e" : "#f4505e";
+      if (!list.length) {
+        note("err", p.key
+          ? "No chat models found for this key."
+          : "The server answered but has no models yet. With Ollama: ollama pull <model>.");
+      }
+    } catch (err) {
+      if (current() !== p) return;
+      const message = String(err).replace(/^Error:\s*/, "");
+      fillModels(p.id === "anthropic" ? CLAUDE_MODELS : []);
+      // Off on purpose, between uses: not an error.
+      const off = message.startsWith("The local server is off");
+      dot.style.background = off ? "#9ca3af" : "#f4505e";
+      note(off ? "ok" : "err", message);
+    }
+  }
+
+  function showProvider() {
+    const p = current();
+    keyRow.style.display = p.key ? "" : "none";
+    urlRow.style.display = p.key ? "none" : "";
+    lifecycle.style.display = p.key ? "none" : "";
+    urlField.value = settings.localUrl;
+    startField.value = settings.localStartCommand;
+    stopField.value = settings.localStopCommand;
+    keyField.value = "";
+    clear(feedback);
+    void loadModels();
+  }
+
+  provider.addEventListener("change", () => {
+    settings.provider = provider.value as Provider;
+    void save();
+    showProvider();
+  });
+
+  saveKey.addEventListener("click", async () => {
+    const p = current();
+    const value = keyField.value.trim();
+    if (!value || !p.key) return;
+    try {
+      await Bridge.secretSet(p.key, value);
+      keyField.value = "";
+      note("ok", "Saved. It never touches disk.");
+      await loadModels();
+    } catch (err) {
+      note("err", `Could not save: ${String(err)}`);
+    }
+  });
+
+  clearKey.addEventListener("click", async () => {
+    const p = current();
+    if (!p.key) return;
+    try {
+      await Bridge.secretClear(p.key);
+      note("ok", "Key removed.");
+      await loadModels();
+    } catch (err) {
+      note("err", `Could not remove: ${String(err)}`);
+    }
+  });
+
+  connect.addEventListener("click", async () => {
+    const value = urlField.value.trim();
+    if (!value) return;
+    settings.localUrl = value;
+    await save();
+    clear(feedback);
+    await loadModels(true);
+  });
+
+  refresh.addEventListener("click", () => {
+    clear(feedback);
+    void loadModels(true);
+  });
+
+  model.addEventListener("change", () => {
+    customRow.style.display = model.value === OTHER_MODEL ? "" : "none";
+    if (model.value === OTHER_MODEL) {
+      custom.focus();
+      return;
+    }
+    setModelOf(current().id, model.value);
+    void save();
+  });
+
+  useCustom.addEventListener("click", () => {
+    const id = custom.value.trim();
+    if (!id) return;
+    setModelOf(current().id, id);
+    void save();
+    custom.value = "";
+    void loadModels();
+  });
+
+  showProvider();
 
   return h(
     "section",
     {},
-    h("h2", {}, dot, h("span", { text: "Claude" })),
+    h("h2", {}, dot, h("span", { text: "AI chat" })),
     state,
-    h("div", { class: "row" }, h("label", { text: "API key" }), field, saveBtn, clearBtn),
-    h("div", { class: "row" }, h("label", { text: "Model" }), model),
+    h("div", { class: "row" }, h("label", { text: "Provider" }), provider),
+    keyRow,
+    urlRow,
+    h("div", { class: "row" }, h("label", { text: "Model" }), model, refresh),
+    lifecycle,
+    customRow,
+    h("div", { class: "row" }, h("label", { text: "When it hides" }), onHide),
     feedback,
   );
 }
@@ -437,8 +648,6 @@ async function main() {
     installed: false, settingsPath: "", hookPath: "", hookReady: false,
   };
 
-  const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
-
   const keys = [
     "stripe-api-key", "github-token", "vercel-token",
     "n8n-url", "n8n-api-key", "resend-api-key", "notion-api-key", "calcom-api-key",
@@ -450,7 +659,7 @@ async function main() {
   root.append(
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     claudeSection(status),
-    apiSection(hasKey),
+    aiSection(),
     integrationsSection(present),
     generalSection(),
     h("div", {

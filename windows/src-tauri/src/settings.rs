@@ -21,10 +21,46 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Who answers the chat: "anthropic", "openai", "gemini" or "local".
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// Models for the other providers, picked from the provider's own list.
+    #[serde(default)]
+    pub openai_model: String,
+    #[serde(default)]
+    pub gemini_model: String,
+    #[serde(default)]
+    pub local_model: String,
+    /// Address of the local OpenAI-compatible server (Ollama, LM Studio...).
+    #[serde(default = "default_local_url")]
+    pub local_url: String,
+    /// Starts the local server when a question finds it down, e.g.
+    /// `podman start ollama`. Empty: Coucou never starts anything.
+    #[serde(default)]
+    pub local_start_command: String,
+    /// Stops it again once idle, e.g. `podman stop ollama`.
+    #[serde(default)]
+    pub local_stop_command: String,
+    /// Start a fresh conversation every time the island hides, instead of
+    /// picking up where it left off.
+    #[serde(default)]
+    pub clear_chat_on_hide: bool,
+    /// Lets a local model that supports it act: search, read and create files,
+    /// browse the web. Every write still waits for a click.
+    #[serde(default)]
+    pub tools_enabled: bool,
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_provider() -> String {
+    "anthropic".into()
+}
+
+fn default_local_url() -> String {
+    crate::local_llm::DEFAULT_URL.to_string()
 }
 
 impl Default for Settings {
@@ -44,6 +80,15 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            provider: default_provider(),
+            openai_model: String::new(),
+            gemini_model: String::new(),
+            local_model: String::new(),
+            local_url: default_local_url(),
+            local_start_command: String::new(),
+            local_stop_command: String::new(),
+            clear_chat_on_hide: false,
+            tools_enabled: false,
         }
     }
 }

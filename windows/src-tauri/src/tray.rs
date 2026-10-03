@@ -20,7 +20,12 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("Coucou")
         .menu(&menu)
         .on_menu_event(|app: &AppHandle, event| match event.id.as_ref() {
-            "quit" => app.exit(0),
+            "quit" => {
+                // Leave nothing running behind: a local model server Coucou
+                // started goes down with it.
+                crate::local_server::stop_if_ours();
+                app.exit(0)
+            }
             "settings" => crate::show_settings_window(app),
             id => {
                 let _ = app.emit_to(WINDOW_LABEL, "tray", id.to_string());

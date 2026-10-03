@@ -3,9 +3,10 @@
 // identically.
 
 import { h, svg, clear, dot } from "./dom";
+import { Bridge } from "../core/bridge";
 import { ICONS } from "./icons";
 import { Ticker } from "./ticker";
-import { State, type AgentTask } from "../core/state";
+import { State, providerName, type AgentTask } from "../core/state";
 import { washRGBA, type IslandViewName, type Wash } from "../core/layout";
 import { createMiniBot, pruneMiniBots } from "../mochi/minibots";
 import { buildPrompt } from "./chat";
@@ -271,6 +272,7 @@ function lighten(hex: string, amount: number): string {
 // ── Empty ─────────────────────────────────────────────────────────────────────
 
 function buildEmpty(actions: ViewActions): ViewHost {
+  const ask = btn(`Ask ${providerName(State.settings)}`, "primary", () => actions.setView("prompt"));
   const body = h(
     "div",
     { class: "stack", style: "padding:0 18px 0 118px;flex-direction:row;align-items:center;gap:16px" },
@@ -281,9 +283,47 @@ function buildEmpty(actions: ViewActions): ViewHost {
       h("div", { class: "sub", text: "Drop a file or window, or ask me anything." }),
     ),
     h("div", { class: "grow" }),
-    btn("Ask Claude", "primary", () => actions.setView("prompt")),
+    ask,
   );
-  return { el: h("div", { class: "view" }, card(null, body)), sync() {} };
+  return {
+    el: h("div", { class: "view" }, card(null, body)),
+    sync() {
+      ask.firstElementChild!.textContent = `Ask ${providerName(State.settings)}`;
+    },
+  };
+}
+
+// ── Tool approval ─────────────────────────────────────────────────────────────
+
+/** The chat model wants to create or change a file: nothing is written until Allow. */
+function buildToolApproval(actions: ViewActions): ViewHost {
+  const title = h("div", { class: "title" });
+  const detail = h("div", {
+    class: "code",
+    dir: "auto",
+    style: "white-space:pre-wrap;max-height:96px;overflow:auto;text-overflow:clip",
+  });
+  const decide = (allow: boolean) => {
+    const pending = State.toolApproval;
+    if (!pending) return;
+    State.toolApproval = null;
+    State.isPinned = false;
+    void Bridge.toolDecision(pending.id, allow);
+    actions.setView("prompt");
+  };
+  const row = h(
+    "div",
+    { class: "actions" },
+    btn("Deny", "secondary", () => decide(false)),
+    btn("Allow", "primary", () => decide(true)),
+  );
+  return {
+    el: h("div", { class: "view" }, card("amber", stack(116, 16, title, detail, row))),
+    sync() {
+      title.textContent = State.toolApproval?.title ?? "";
+      detail.textContent = State.toolApproval?.detail ?? "";
+    },
+  };
 }
 
 // ── Approval ──────────────────────────────────────────────────────────────────
@@ -491,6 +531,7 @@ export function buildViews(
   map.set("overview", buildOverview(actions));
   map.set("empty", buildEmpty(actions));
   map.set("approval", buildApproval(actions));
+  map.set("toolApproval", buildToolApproval(actions));
   map.set("question", buildQuestion());
   map.set("error", buildError(actions));
   map.set("finished", buildFinished(actions));
@@ -503,7 +544,7 @@ export function buildViews(
   map.set("choose", buildChoose(actions));
   // Not in the Windows v1: sending a file by email, window attach + web result.
   map.set("mail", buildPlaceholder("Sending by email isn't in this version.", ""));
-  map.set("searching", buildPlaceholder("Claude is searching…", ""));
+  map.set("searching", buildPlaceholder("Searching…", ""));
   map.set("result", buildPlaceholder("Result", ""));
   return map;
 }

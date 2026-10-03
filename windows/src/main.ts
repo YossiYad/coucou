@@ -3,7 +3,7 @@
 import "./style.css";
 import { Bridge, IS_TAURI, onEvent } from "./core/bridge";
 import { Sound } from "./core/sound";
-import { State, type Settings } from "./core/state";
+import { State, type Settings, type ToolApproval } from "./core/state";
 import { Island } from "./island/island";
 import { registerHookHandlers } from "./island/hooks";
 import { registerIntegrationHandlers, refreshConfigured } from "./island/integrations";
@@ -29,6 +29,26 @@ async function main() {
   await onEvent<{ x: number; y: number }>("cursor", ({ x, y }) => island.onCursor(x, y));
   await onEvent<null>("pointer-left", () => island.pointerExited());
   await onEvent<null>("pointer-entered", () => island.pointerEntered());
+
+  // The chat model at work with its tools.
+  await onEvent<{ text: string }>("tool-activity", ({ text }) => {
+    State.toolActivity = text;
+    State.notify();
+  });
+  await onEvent<ToolApproval>("tool-approval", (request) => {
+    State.toolApproval = request;
+    // Waits for a decision, like a Claude Code permission: never closes on its own.
+    State.isPinned = true;
+    Sound.play("approval");
+    island.alert("toolApproval");
+  });
+  await onEvent<{ id: number }>("tool-approval-done", ({ id }) => {
+    if (State.toolApproval?.id !== id) return;
+    // Timed out unanswered: put the chat back.
+    State.toolApproval = null;
+    State.isPinned = false;
+    if (State.view === "toolApproval") island.setView("prompt");
+  });
 
   /** Pause has to reach Rust too, or the pollers keep calling out. */
   const setPaused = (on: boolean) => {
@@ -59,6 +79,11 @@ async function main() {
 
   // The settings window writes preferences; apply them here without a restart.
   await onEvent<Settings>("settings-changed", (s) => {
+    // Each provider keeps its own history format: another one starts afresh.
+    if (s.provider && s.provider !== State.settings.provider) {
+      State.chatHistory = [];
+      void Bridge.chatReset();
+    }
     State.settings = { ...State.settings, ...s };
     island.applySettings();
     State.loadIntegrationTasks();

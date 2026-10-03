@@ -281,6 +281,12 @@ export class Island {
       // nothing while hidden.
       UploadSeq.deactivate();
     }
+    if (mode === "hidden" && State.settings.clearChatOnHide) {
+      State.chatHistory = [];
+      State.promptContext = null;
+      State.droppedFile = null;
+      void Bridge.chatReset();
+    }
     this.updateWindowCollapsed();
     this.animateGeometry(modeOrder(mode) < modeOrder(prev));
     State.notify();
