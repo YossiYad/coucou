@@ -1,130 +1,74 @@
-// Claude API client — the same integration as ClaudeService.swift: multi-turn
-// chat with web search, and files sent as document/image/text blocks.
-//
-// Everything happens here rather than in the island: the API key never leaves
-// the Credential Manager, and file bytes never cross the IPC boundary.
+// Claude through the Messages API - the same integration as ClaudeService.swift:
+// multi-turn chat with web search, PDFs as documents, images as images.
 
-use std::sync::Mutex;
-
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::ai::{self, Answer, Attachment, ModelInfo, UserTurn};
 use crate::secrets;
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+const MODELS_ENDPOINT: &str = "https://api.anthropic.com/v1/models?limit=100";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Server-side fallback: on a policy decline the API retries the same request on
 /// a fallback model inside the same call, so the island never shows a dead end.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MAX_TOKENS: u32 = 4096;
-/// Text and code files are inlined; anything larger is skipped, as on macOS.
-const MAX_INLINE_TEXT: u64 = 200_000;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
-const SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. \
-You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
-Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
-No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
-
-#[derive(Default)]
-pub struct Chat {
-    /// Full multi-turn history, including tool_use / tool_result blocks.
-    messages: Mutex<Vec<Value>>,
+fn key() -> Result<String, String> {
+    secrets::get("anthropic-api-key").ok_or_else(|| "Claude API key missing. Open settings.".into())
 }
 
-impl Chat {
-    pub fn reset(&self) {
-        self.messages.lock().unwrap().clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.messages.lock().unwrap().is_empty()
-    }
-
-    fn push(&self, message: Value) {
-        self.messages.lock().unwrap().push(message);
-    }
-
-    fn pop(&self) {
-        self.messages.lock().unwrap().pop();
-    }
-
-    fn snapshot(&self) -> Vec<Value> {
-        self.messages.lock().unwrap().clone()
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-pub enum ChatContext {
-    File { name: String, path: String },
-    Window { app_name: String, title: String, url: Option<String> },
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatReply {
-    pub text: String,
-}
-
-/// One chat turn. Returns the assistant's text, or a message the island shows
-/// in the note view.
-pub async fn send(
-    chat: &Chat,
-    model: &str,
-    query: String,
-    context: Option<ChatContext>,
-) -> Result<ChatReply, String> {
-    let key = secrets::get("anthropic-api-key")
-        .ok_or_else(|| "API key missing. Open settings.".to_string())?;
-
+pub fn user_message(turn: &UserTurn) -> Value {
     let mut content: Vec<Value> = Vec::new();
-
-    // File / window context rides along with the first message only, exactly
-    // like ClaudeService.chat().
-    if chat.is_empty() {
-        match &context {
-            Some(ChatContext::File { name, path }) => {
-                if let Some(block) = file_block(path) {
-                    content.push(block);
-                }
-                content.push(json!({ "type": "text", "text": format!("File: {name}") }));
-            }
-            Some(ChatContext::Window { app_name, title, url }) => {
-                let mut text = format!("Context — App: {app_name}, Window: {title}");
-                if let Some(url) = url {
-                    text.push_str(&format!(", URL: {url}"));
-                }
-                content.push(json!({ "type": "text", "text": text }));
+    if let Some(file) = &turn.file {
+        match &file.content {
+            Some(Attachment::Image { media, data }) => content.push(json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media, "data": ai::base64(data) },
+            })),
+            Some(Attachment::Pdf(data)) => content.push(json!({
+                "type": "document",
+                "source": { "type": "base64", "media_type": "application/pdf", "data": ai::base64(data) },
+            })),
+            Some(Attachment::Text(text)) => {
+                content.push(json!({ "type": "text", "text": format!("File contents:\n{text}") }))
             }
             None => {}
         }
+        content.push(json!({ "type": "text", "text": file.label() }));
     }
-    content.push(json!({ "type": "text", "text": query }));
+    if let Some(window) = &turn.window {
+        content.push(json!({ "type": "text", "text": window }));
+    }
+    content.push(json!({ "type": "text", "text": turn.text }));
+    json!({ "role": "user", "content": content })
+}
 
-    chat.push(json!({ "role": "user", "content": content }));
-
+pub async fn complete(model: &str, history: &[Value]) -> Result<Answer, String> {
+    let key = key()?;
     let body = json!({
-        "model": model,
+        "model": ai::require_model(model)?,
         "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
+        "system": ai::system_prompt(true),
         "tools": [{ "type": "web_search_20260209", "name": "web_search", "max_uses": 5 }],
         "fallbacks": "default",
-        "messages": chat.snapshot(),
+        "messages": history,
     });
+    let request = ai::client(90)?
+        .post(ENDPOINT)
+        .header("x-api-key", &key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("anthropic-beta", FALLBACK_BETA)
+        .json(&body);
+    let response = ai::send_json(request).await.map_err(|e| e.describe("Claude API"))?;
+    parse(&response)
+}
 
-    let response = match call(&key, &body).await {
-        Ok(v) => v,
-        Err(err) => {
-            chat.pop(); // keep the history consistent with what the model saw
-            return Err(err);
-        }
-    };
-
+fn parse(response: &Value) -> Result<Answer, String> {
     // A policy decline comes back as HTTP 200 with stop_reason "refusal".
     if response.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
-        chat.pop();
         let why = response
             .get("stop_details")
             .and_then(|d| d.get("explanation"))
@@ -133,15 +77,9 @@ pub async fn send(
         return Err(why.to_string());
     }
 
-    let Some(blocks) = response.get("content").and_then(Value::as_array).cloned() else {
-        chat.pop();
+    let Some(blocks) = response.get("content").and_then(Value::as_array) else {
         return Err("Unexpected API response.".into());
     };
-
-    // Store the whole content — tool_use / tool_result blocks included — so the
-    // next turn has the right context.
-    chat.push(json!({ "role": "assistant", "content": blocks.clone() }));
-
     let text = blocks
         .iter()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
@@ -150,114 +88,71 @@ pub async fn send(
         .join("\n")
         .trim()
         .to_string();
-
     if text.is_empty() {
         return Err("No response text.".into());
     }
-    Ok(ChatReply { text })
+    // The whole content - tool_use / tool_result blocks included - so the next
+    // turn has the right context.
+    Ok(Answer { stored: json!({ "role": "assistant", "content": blocks }), text })
 }
 
-async fn call(key: &str, body: &Value) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(90))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .post(ENDPOINT)
-        .header("x-api-key", key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("anthropic-beta", FALLBACK_BETA)
-        .header("content-type", "application/json")
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    let status = response.status();
-    let text = response.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        // Surface the API's own message, which is what makes a bad key obvious.
-        let detail = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        return Err(format!("Claude API {status}: {detail}"));
-    }
-    serde_json::from_str(&text).map_err(|e| format!("Bad API response: {e}"))
-}
-
-/// PDF → document block, image → image block, text/code → inline text.
-/// Mirrors readFileAsBlock() in ClaudeService.swift.
-fn file_block(path: &str) -> Option<Value> {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let media_type = match ext.as_str() {
-        "pdf" => Some(("document", "application/pdf")),
-        "jpg" | "jpeg" => Some(("image", "image/jpeg")),
-        "png" => Some(("image", "image/png")),
-        "gif" => Some(("image", "image/gif")),
-        "webp" => Some(("image", "image/webp")),
-        _ => None,
-    };
-
-    if let Some((block_type, media)) = media_type {
-        let bytes = std::fs::read(path).ok()?;
-        return Some(json!({
-            "type": block_type,
-            "source": { "type": "base64", "media_type": media, "data": base64(&bytes) },
-        }));
-    }
-
-    let len = std::fs::metadata(path).ok()?.len();
-    if len > MAX_INLINE_TEXT {
-        return None;
-    }
-    let text = std::fs::read_to_string(path).ok()?;
-    Some(json!({ "type": "text", "text": format!("File contents:\n{text}") }))
-}
-
-/// Small standalone base64 encoder — not worth another dependency.
-/// Also used for Stripe's basic auth.
-pub(crate) fn base64_for(bytes: &[u8]) -> String {
-    base64(bytes)
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
-    }
-    out
+pub async fn models() -> Result<Vec<ModelInfo>, String> {
+    let key = key()?;
+    let request = ai::client(20)?
+        .get(MODELS_ENDPOINT)
+        .header("x-api-key", &key)
+        .header("anthropic-version", ANTHROPIC_VERSION);
+    let response = ai::send_json(request).await.map_err(|e| e.describe("Claude API"))?;
+    Ok(response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?.to_string();
+            let label = m.get("display_name").and_then(Value::as_str).unwrap_or(&id).to_string();
+            Some(ModelInfo { id, label })
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::base64;
+    use super::*;
+    use crate::ai::FileNote;
 
     #[test]
-    fn base64_matches_rfc4648_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    fn a_pdf_rides_along_as_a_document_before_the_question() {
+        let turn = UserTurn {
+            text: "summarise".into(),
+            file: Some(FileNote { name: "a.pdf".into(), content: Some(Attachment::Pdf(b"%PDF".to_vec())) }),
+            window: None,
+        };
+        let message = user_message(&turn);
+        let content = message["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "document");
+        assert_eq!(content[1]["text"], "File: a.pdf");
+        assert_eq!(content[2]["text"], "summarise");
+    }
+
+    #[test]
+    fn a_refusal_is_an_error_with_its_explanation() {
+        let response = json!({
+            "stop_reason": "refusal",
+            "stop_details": { "explanation": "Not this one." },
+        });
+        assert_eq!(parse(&response).err().unwrap(), "Not this one.");
+    }
+
+    #[test]
+    fn text_blocks_are_joined_and_tool_blocks_kept_in_the_history() {
+        let response = json!({ "content": [
+            { "type": "server_tool_use", "id": "x" },
+            { "type": "text", "text": "Hello" },
+            { "type": "text", "text": "there" },
+        ]});
+        let answer = parse(&response).ok().unwrap();
+        assert_eq!(answer.text, "Hello\nthere");
+        assert_eq!(answer.stored["content"].as_array().unwrap().len(), 3);
     }
 }

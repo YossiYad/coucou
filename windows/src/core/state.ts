@@ -92,6 +92,44 @@ export interface Settings {
   hooksInstalled: boolean;
   /** Claude model used by the chat. */
   model: string;
+  /** Who answers the chat. */
+  provider: Provider;
+  openaiModel: string;
+  geminiModel: string;
+  localModel: string;
+  /** Local OpenAI-compatible server (Ollama, LM Studio...). */
+  localUrl: string;
+  /** Run when a question finds the local server down, e.g. `podman start ollama`. */
+  localStartCommand: string;
+  /** Run once it has sat idle, e.g. `podman stop ollama`. */
+  localStopCommand: string;
+  /** Start a fresh conversation every time the island hides. */
+  clearChatOnHide: boolean;
+  /** Let a local model act: search, read and create files, browse the web. */
+  toolsEnabled: boolean;
+}
+
+/** A change the model wants to make, waiting for Allow / Deny. */
+export interface ToolApproval {
+  id: number;
+  title: string;
+  detail: string;
+}
+
+export type Provider = "anthropic" | "openai" | "gemini" | "local";
+
+/** The name the island uses for whoever answers: "Ask Claude", "Ask qwen3"... */
+export function providerName(s: Settings): string {
+  switch (s.provider) {
+    case "openai":
+      return "ChatGPT";
+    case "gemini":
+      return "Gemini";
+    case "local":
+      return s.localModel ? s.localModel.split(":")[0] : "local AI";
+    default:
+      return "Claude";
+  }
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -106,6 +144,15 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   hooksInstalled: false,
   model: "claude-opus-5",
+  provider: "anthropic",
+  openaiModel: "",
+  geminiModel: "",
+  localModel: "",
+  localUrl: "http://localhost:11434",
+  localStartCommand: "",
+  localStopCommand: "",
+  clearChatOnHide: false,
+  toolsEnabled: false,
 };
 
 type Listener = () => void;
@@ -137,6 +184,10 @@ class AppState {
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
   pendingApproval: ApprovalInfo | null = null;
+  /** A file change the chat model asked for, awaiting a click. */
+  toolApproval: ToolApproval | null = null;
+  /** What the chat model is doing right now: "Reading report.pdf…". */
+  toolActivity: string | null = null;
 
   integrations: Record<string, IntegrationInfo> = {};
 

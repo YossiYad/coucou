@@ -15,17 +15,22 @@ function bubble(message: ChatMessage): HTMLElement {
     return h(
       "div",
       { class: "chat-row user" },
-      h("div", { class: "bubble", text: message.content }),
+      h("div", { class: "bubble", dir: "auto", text: message.content }),
     );
   }
-  return h("div", { class: "chat-row" }, h("div", { class: "reply", text: message.content }));
+  // dir="auto": Hebrew or Arabic reads right to left, punctuation included.
+  return h("div", { class: "chat-row" }, h("div", { class: "reply", dir: "auto", text: message.content }));
 }
 
-function typingDots(): HTMLElement {
+function typingDots(activity: string | null): HTMLElement {
   return h(
     "div",
     { class: "chat-row" },
     h("div", { class: "typing" }, h("i"), h("i"), h("i")),
+    // What the model is doing with its tools: "Reading report.pdf…".
+    activity
+      ? h("div", { class: "reply", dir: "auto", style: "opacity:.6;font-size:12px;margin-inline-start:8px", text: activity })
+      : null,
   );
 }
 
@@ -44,6 +49,7 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     class: "chat-input",
     placeholder: "Ask me anything…",
     spellcheck: "false",
+    dir: "auto",
   }) as HTMLInputElement;
   const send = h("button", { class: "send-btn", title: "Send" }, svg(ICONS.arrowUp, 11));
   const bar = h("div", { class: "chat-bar" }, input, send);
@@ -56,7 +62,7 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
   (el.querySelector(".card") as HTMLElement).style.setProperty("--wash", "rgba(99,102,241,0.5)");
 
   let sending = false;
-  let renderedCount = -1;
+  let renderedKey = "";
 
   async function submit() {
     const query = input.value.trim();
@@ -74,17 +80,26 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     const context: ChatContext | null =
       State.chatHistory.length === 1 && file ? { kind: "file", name: file.name, path: file.path } : null;
 
+    // The conversation may be cleared while the answer is on its way (the
+    // island hid): it then belongs to nothing on screen.
+    const conversation = State.chatHistory;
+    State.toolActivity = null;
     try {
       const reply = await Bridge.chatSend(query, context);
-      State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text });
       State.stateOverride = null;
-      Sound.play("finish");
+      if (State.chatHistory === conversation) {
+        State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text });
+        Sound.play("finish");
+      }
     } catch (err) {
       State.stateOverride = null;
-      State.noteMessage = String(err).replace(/^Error:\s*/, "");
-      State.view = "note";
-      Sound.play("error");
+      if (State.chatHistory === conversation) {
+        State.noteMessage = String(err).replace(/^Error:\s*/, "");
+        State.view = "note";
+        Sound.play("error");
+      }
     } finally {
+      State.toolActivity = null;
       sending = false;
       State.notify();
       onHeightChange();
@@ -113,12 +128,12 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
       }
 
       const thinking = State.stateOverride === "thinking";
-      const count = State.chatHistory.length + (thinking ? 0.5 : 0);
-      if (count !== renderedCount) {
-        renderedCount = count;
+      const key = `${State.chatHistory.length}|${thinking}|${thinking ? State.toolActivity ?? "" : ""}`;
+      if (key !== renderedKey) {
+        renderedKey = key;
         clear(log);
         for (const m of State.chatHistory) log.append(bubble(m));
-        if (thinking) log.append(typingDots());
+        if (thinking) log.append(typingDots(State.toolActivity));
         log.scrollTop = log.scrollHeight;
       }
 

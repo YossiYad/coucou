@@ -21,6 +21,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+calamine = { version = "0.36.1", features = ["dates"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
+pdf-extract = "0.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
+whatlang = "0.18.0"
+rust_xlsxwriter = "0.99.1"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
@@ -41,3 +47,6 @@ windows = { version = "0.61", features = [
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
 gtk = "0.18"
 libc = "0.2"
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
