@@ -43,8 +43,9 @@ pub async fn complete(model: &str, history: &[Value]) -> Result<Answer, String> 
         "tools": [{ "google_search": {} }],
     });
     let response = match post(&key, &model, &body).await {
-        // Not every model can search: ask again without grounding.
-        Err(err) if err.is_tool_refusal() => {
+        // Not every model can search, and a free key runs out of search
+        // quota while plain answers still work: ask again without grounding.
+        Err(err) if search_refused(&err) => {
             body.as_object_mut().unwrap().remove("tools");
             body["systemInstruction"]["parts"][0]["text"] = json!(ai::system_prompt(false));
             post(&key, &model, &body).await
@@ -58,7 +59,30 @@ pub async fn complete(model: &str, history: &[Value]) -> Result<Answer, String> 
 async fn post(key: &str, model: &str, body: &Value) -> Result<Value, ai::ApiError> {
     let client = ai::client(120).map_err(|message| ai::ApiError { status: 0, message })?;
     let url = format!("{BASE}/models/{model}:generateContent");
-    ai::send_json(client.post(url).header("x-goog-api-key", key).json(body)).await
+    let mut waits = RETRY_WAITS.iter();
+    loop {
+        let result = ai::send_json(client.post(&url).header("x-goog-api-key", key).json(body)).await;
+        match (result, waits.next()) {
+            (Err(err), Some(&secs)) if overloaded(&err) => {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            }
+            (result, _) => return result,
+        }
+    }
+}
+
+/// Google answers 503 "high demand" in short spikes; the same request usually
+/// goes through seconds later.
+const RETRY_WAITS: &[u64] = &[2, 5];
+
+fn overloaded(err: &ai::ApiError) -> bool {
+    err.status == 503 || err.status == 500
+}
+
+/// A 429 on a grounded request is Google's search quota, which a free key
+/// has far less of than plain answers.
+fn search_refused(err: &ai::ApiError) -> bool {
+    err.is_tool_refusal() || err.status == 429
 }
 
 /// The model id goes into the URL path, so only plain id characters pass.
@@ -146,6 +170,25 @@ mod tests {
         assert_eq!(model_path("models/gemini-2.5-flash").unwrap(), "gemini-2.5-flash");
         assert!(model_path("../../evil").is_err());
         assert!(model_path("gemini?key=x").is_err());
+    }
+
+    #[test]
+    fn a_search_quota_or_refusal_falls_back_to_plain_answers() {
+        let err = |status, message: &str| ai::ApiError { status, message: message.into() };
+        assert!(search_refused(&err(429, "You exceeded your current quota")));
+        assert!(search_refused(&err(400, "Search grounding is not supported")));
+        assert!(!search_refused(&err(400, "API key not valid")));
+        assert!(!search_refused(&err(403, "permission denied")));
+    }
+
+    #[test]
+    fn only_a_busy_server_is_asked_again() {
+        let err = |status| ai::ApiError { status, message: String::new() };
+        assert!(overloaded(&err(503)));
+        assert!(overloaded(&err(500)));
+        assert!(!overloaded(&err(429)));
+        assert!(!overloaded(&err(400)));
+        assert!(!overloaded(&err(0)));
     }
 
     #[test]
