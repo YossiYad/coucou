@@ -4,7 +4,7 @@
 use serde_json::{json, Value};
 
 use crate::ai::{self, Answer, Attachment, ModelInfo, UserTurn};
-use crate::secrets;
+use crate::{agent, secrets};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const MODELS_ENDPOINT: &str = "https://api.anthropic.com/v1/models?limit=100";
@@ -17,7 +17,7 @@ const MAX_TOKENS: u32 = 4096;
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
 fn key() -> Result<String, String> {
-    secrets::get("anthropic-api-key").ok_or_else(|| "Claude API key missing. Open settings.".into())
+    secrets::get_current("anthropic-api-key").ok_or_else(|| "Claude API key missing. Open settings.".into())
 }
 
 pub fn user_message(turn: &UserTurn) -> Value {
@@ -64,6 +64,60 @@ pub async fn complete(model: &str, history: &[Value]) -> Result<Answer, String> 
         .json(&body);
     let response = ai::send_json(request).await.map_err(|e| e.describe("Claude API"))?;
     parse(&response)
+}
+
+/// One request of a chat turn with tools: the answer, or the tools to run.
+pub async fn step(model: &str, system: &str, messages: &[Value], definitions: &Value) -> Result<agent::Turn, String> {
+    let key = key()?;
+    let mut tools: Vec<Value> = agent::functions(definitions)
+        .into_iter()
+        .map(|(name, description, schema)| json!({ "name": name, "description": description, "input_schema": schema }))
+        .collect();
+    tools.push(json!({ "type": "web_search_20260209", "name": "web_search", "max_uses": 5 }));
+    let body = json!({
+        "model": ai::require_model(model)?,
+        "max_tokens": MAX_TOKENS,
+        "system": system,
+        "tools": tools,
+        "fallbacks": "default",
+        "messages": messages,
+    });
+    let request = ai::client(120)?
+        .post(ENDPOINT)
+        .header("x-api-key", &key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("anthropic-beta", FALLBACK_BETA)
+        .json(&body);
+    let response = ai::send_json(request).await.map_err(|e| e.describe("Claude API"))?;
+    read_step(&response)
+}
+
+fn read_step(response: &Value) -> Result<agent::Turn, String> {
+    let blocks = response.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
+    let calls: Vec<agent::Call> = blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .map(|b| agent::Call {
+            id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+            name: b.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+            args: agent::arguments(b.get("input")),
+        })
+        .collect();
+    let paused = response.get("stop_reason").and_then(Value::as_str) == Some("pause_turn");
+    if calls.is_empty() && !paused {
+        return parse(response).map(agent::Turn::Answer);
+    }
+    Ok(agent::Turn::Calls { assistant: vec![json!({ "role": "assistant", "content": blocks })], calls })
+}
+
+/// Every result of one turn's calls, in one user message as the API wants.
+pub fn tool_results(calls: &[agent::Call], outputs: &[String]) -> Vec<Value> {
+    let content: Vec<Value> = calls
+        .iter()
+        .zip(outputs)
+        .map(|(call, output)| json!({ "type": "tool_result", "tool_use_id": call.id, "content": output }))
+        .collect();
+    vec![json!({ "role": "user", "content": content })]
 }
 
 fn parse(response: &Value) -> Result<Answer, String> {

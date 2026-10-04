@@ -4,12 +4,12 @@
 use serde_json::{json, Value};
 
 use crate::ai::{self, Answer, Attachment, ModelInfo, UserTurn};
-use crate::secrets;
+use crate::{agent, secrets};
 
 const BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 fn key() -> Result<String, String> {
-    secrets::get("gemini-api-key").ok_or_else(|| "Gemini API key missing. Open settings.".into())
+    secrets::get_current("gemini-api-key").ok_or_else(|| "Gemini API key missing. Open settings.".into())
 }
 
 pub fn user_message(turn: &UserTurn) -> Value {
@@ -52,8 +52,90 @@ pub async fn complete(model: &str, history: &[Value]) -> Result<Answer, String> 
         }
         other => other,
     }
-    .map_err(|e| e.describe("Gemini API"))?;
+    .map_err(|e| explain(&e))?;
     parse(&response)
+}
+
+/// Gemini's quota errors run to a paragraph of links and metric names; the
+/// island says what happened and what to do.
+fn explain(err: &ai::ApiError) -> String {
+    if err.status != 429 || !err.message.contains("free_tier") {
+        return err.describe("Gemini API");
+    }
+    let after = |key: &str| {
+        err.message.split(key).nth(1).map(|rest| {
+            rest.trim_start().split(|c: char| c == ',' || c.is_whitespace()).next().unwrap_or("").trim_end_matches('.').to_string()
+        })
+    };
+    let model = after("model:").filter(|m| !m.is_empty()).unwrap_or_else(|| "this model".into());
+    let limit = after("limit:").filter(|l| !l.is_empty()).map(|l| format!(" ({l} requests on the free tier)")).unwrap_or_default();
+    let retry = after("retry in").filter(|r| !r.is_empty()).map(|r| format!(" Google says to try again in {r}.")).unwrap_or_default();
+    format!(
+        "Gemini's free quota for {model} is used up for now{limit}.{retry} Each step of a task with tools is one request, \
+so a free key runs out fast. Another Gemini model in Settings has its own quota, or switch to the local model."
+    )
+}
+
+/// One request of a chat turn with tools: the answer, or the tools to run.
+/// No Google Search here: its quota runs out long before plain answers do,
+/// and the search_web tool covers it.
+pub async fn step(model: &str, system: &str, messages: &[Value], definitions: &Value) -> Result<agent::Turn, String> {
+    let key = key()?;
+    let model = model_path(ai::require_model(model)?)?;
+    let declarations: Vec<Value> = agent::functions(definitions)
+        .into_iter()
+        .map(|(name, description, schema)| json!({ "name": name, "description": description, "parameters": schema }))
+        .collect();
+    let body = json!({
+        "systemInstruction": { "parts": [{ "text": system }] },
+        "contents": messages,
+        "tools": [{ "functionDeclarations": declarations }],
+    });
+    let response = post(&key, &model, &body).await.map_err(|e| explain(&e))?;
+    read_step(&response)
+}
+
+fn read_step(response: &Value) -> Result<agent::Turn, String> {
+    let content = response.pointer("/candidates/0/content").cloned();
+    let calls: Vec<agent::Call> = content
+        .as_ref()
+        .and_then(|c| c.get("parts"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.get("functionCall"))
+        .map(|f| {
+            let name = f.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            agent::Call {
+                id: f.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                args: agent::arguments(f.get("args")),
+                name,
+            }
+        })
+        .collect();
+    if calls.is_empty() {
+        return parse(response).map(agent::Turn::Answer);
+    }
+    // Sent back exactly as it came, thought signatures included: Gemini needs
+    // them to carry on with the calls.
+    let mut turn = content.unwrap_or_else(|| json!({ "parts": [] }));
+    turn["role"] = json!("model");
+    Ok(agent::Turn::Calls { assistant: vec![turn], calls })
+}
+
+pub fn tool_results(calls: &[agent::Call], outputs: &[String]) -> Vec<Value> {
+    let parts: Vec<Value> = calls
+        .iter()
+        .zip(outputs)
+        .map(|(call, output)| {
+            let mut response = json!({ "name": call.name, "response": { "result": output } });
+            if !call.id.is_empty() {
+                response["id"] = json!(call.id);
+            }
+            json!({ "functionResponse": response })
+        })
+        .collect();
+    vec![json!({ "role": "user", "parts": parts })]
 }
 
 async fn post(key: &str, model: &str, body: &Value) -> Result<Value, ai::ApiError> {
@@ -164,6 +246,22 @@ pub async fn models() -> Result<Vec<ModelInfo>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_used_up_free_quota_is_explained_briefly() {
+        let err = ai::ApiError {
+            status: 429,
+            message: "You exceeded your current quota. * Quota exceeded for metric: \
+generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash \
+Please retry in 41.2s."
+                .into(),
+        };
+        let text = explain(&err);
+        assert!(text.starts_with("Gemini's free quota for gemini-3.8-flash is used up for now (20 requests on the free tier)."));
+        assert!(text.contains("try again in 41.2s."));
+        let other = ai::ApiError { status: 429, message: "Resource exhausted".into() };
+        assert_eq!(explain(&other), "Gemini API 429: Resource exhausted");
+    }
 
     #[test]
     fn model_names_cannot_escape_the_url_path() {

@@ -1,10 +1,12 @@
-// Tools a local model can use to act on the computer: find, read and page
-// through files, create and edit them (only once the user allows it in the
-// island), read web pages, search the web and open things.
+// Tools the chat model can use to act on the computer, whichever model it is:
+// find, read and page through files, create and change them, read web pages,
+// search the web and open things.
 //
 // Reads stay inside the home folder and never touch a hidden path, which keeps
 // SSH keys, browser profiles, the keyring, .env files and every app's settings
-// out of reach. Every write is shown in the island first and waits for a click.
+// out of reach. Every step shows in the island's work view, every change as a
+// diff before it is made; whether it then waits for a click depends on the
+// permission mode.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -17,7 +19,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::oneshot;
 
 use crate::island::WINDOW_LABEL;
-use crate::{ai, extract};
+use crate::preview::{self, Cell, Head, Mark, Preview, Row};
+use crate::{ai, docx, extract};
 
 /// One part of a long file or page, about two pages of text.
 const PART_CHARS: usize = 6_000;
@@ -28,9 +31,55 @@ const SEARCH_LIMIT: usize = 30;
 const SEARCH_BUDGET: Duration = Duration::from_secs(8);
 /// Folders full of generated files nobody searches for by name.
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "__pycache__", "venv", "site-packages"];
+/// In auto mode, deleting more than this many rows, columns or paragraphs at
+/// once (or replacing a whole file) still asks first.
+const AUTO_DELETE_LIMIT: usize = 5;
+const AUTO_REMOVED_LINES: usize = 20;
+/// Lines of a file or result shown in the work view while it is read.
+const EXCERPT_LINES: usize = 14;
+pub const DECLINED: &str = "The user declined.";
+const PLAN_REFUSAL: &str = "Plan mode is on, so nothing was changed.";
 
-/// The tools, in the OpenAI function-calling format Ollama and LM Studio take.
-pub fn definitions() -> Value {
+/// Who approves a change, like Claude Code's permission modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Every change waits for Allow.
+    Manual,
+    /// Changes go through, except drastic ones: a whole file replaced, or many
+    /// rows, columns, paragraphs or lines deleted at once.
+    Auto,
+    /// Every change goes through; each is still shown, and a backup kept.
+    AcceptEdits,
+    /// Nothing is changed: the model reads what it needs and proposes a plan.
+    Plan,
+}
+
+impl Mode {
+    pub fn parse(id: &str) -> Self {
+        match id {
+            "auto" => Self::Auto,
+            "acceptEdits" => Self::AcceptEdits,
+            "plan" => Self::Plan,
+            _ => Self::Manual,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// Tools that change something, which plan mode never offers.
+const WRITE_TOOLS: &[&str] = &["create_file", "edit_spreadsheet", "edit_document", "edit_file", "run_command"];
+
+/// The tools, in the OpenAI function-calling format Ollama and LM Studio take;
+/// the cloud providers convert it. Plan mode offers only the ones that read.
+pub fn definitions(mode: Mode) -> Value {
     let tool = |name: &str, description: &str, properties: Value, required: &[&str]| {
         json!({ "type": "function", "function": {
             "name": name,
@@ -38,7 +87,7 @@ pub fn definitions() -> Value {
             "parameters": { "type": "object", "properties": properties, "required": required },
         }})
     };
-    json!([
+    let mut all = json!([
         tool("search_files",
             "Find files and folders in the user's home folder whose name contains the given words (any language, any case).",
             json!({
@@ -51,7 +100,8 @@ pub fn definitions() -> Value {
             json!({ "path": { "type": "string", "description": "Folder path, like ~/Desktop" } }),
             &["path"]),
         tool("read_file",
-            "Read a file: text, code, spreadsheets, Word, PowerPoint, LibreOffice or PDF. Long files come in parts \
+            "Read a file: text, code, spreadsheets, Word, PowerPoint, LibreOffice or PDF. Spreadsheets come with row numbers \
+and Word documents with paragraph (¶) and table row numbers, which the edit tools take. Long files come in parts \
 (PDFs page by page); the answer says how many there are, so ask for the next part only if you need it.",
             json!({
                 "path": { "type": "string", "description": "File path, like ~/Desktop/report.pdf" },
@@ -60,7 +110,7 @@ pub fn definitions() -> Value {
             &["path"]),
         tool("create_file",
             "Create a file, or replace one with overwrite. A spreadsheet (.xlsx or .csv) takes rows: a list of rows, each a \
-list of cell values. Any other file takes lines: a list of text lines. The user must approve before anything is written.",
+list of cell values. Any other file takes lines: a list of text lines. The user sees the file before it is written.",
             json!({
                 "path": { "type": "string", "description": "Where to save it, like ~/Desktop/notes.txt" },
                 "rows": {
@@ -74,9 +124,9 @@ list of cell values. Any other file takes lines: a list of text lines. The user 
             }),
             &["path"]),
         tool("edit_spreadsheet",
-            "Change an existing spreadsheet (.xlsx) in place, keeping all its formatting: delete rows and set cell \
-values. Use the row numbers and column letters read_file shows. Never rewrite a spreadsheet with create_file. The user \
-must approve.",
+            "Change an existing spreadsheet (.xlsx) in place, keeping all its formatting: delete rows or columns and set \
+cell values. Use the row numbers and column letters read_file shows. Never rewrite a spreadsheet with create_file. The \
+user sees the change before it is made.",
             json!({
                 "path": { "type": "string" },
                 "sheet": { "type": "string", "description": "Sheet name; the first sheet if left out" },
@@ -84,6 +134,11 @@ must approve.",
                     "type": "array",
                     "description": "Row numbers to delete, as read_file shows them",
                     "items": { "type": "integer" },
+                },
+                "delete_columns": {
+                    "type": "array",
+                    "description": "Column letters to delete, like C",
+                    "items": { "type": "string" },
                 },
                 "set_cells": {
                     "type": "array",
@@ -99,8 +154,55 @@ must approve.",
                 },
             }),
             &["path"]),
+        tool("edit_document",
+            "Change an existing Word document (.docx) in place, keeping all its formatting: delete paragraphs or table \
+rows, replace text, or add paragraphs. Use the ¶ paragraph numbers and table row numbers read_file shows. Never rewrite \
+a document with create_file. The user sees the change before it is made.",
+            json!({
+                "path": { "type": "string" },
+                "delete_paragraphs": {
+                    "type": "array",
+                    "description": "Paragraph numbers (¶) to delete",
+                    "items": { "type": "integer" },
+                },
+                "delete_table_rows": {
+                    "type": "array",
+                    "description": "Table rows to delete",
+                    "items": {
+                        "type": "object",
+                        "properties": { "table": { "type": "integer" }, "row": { "type": "integer" } },
+                        "required": ["table", "row"],
+                    },
+                },
+                "replace": {
+                    "type": "array",
+                    "description": "Text to replace; each find must appear once (in the given paragraph, if one is given)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "find": { "type": "string" },
+                            "replace": { "type": "string" },
+                            "paragraph": { "type": "integer" },
+                        },
+                        "required": ["find", "replace"],
+                    },
+                },
+                "insert": {
+                    "type": "array",
+                    "description": "New paragraphs, after paragraph number `after` (0 for the very start)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "after": { "type": "integer" },
+                            "lines": { "type": "array", "items": { "type": "string" } },
+                        },
+                        "required": ["after", "lines"],
+                    },
+                },
+            }),
+            &["path"]),
         tool("edit_file",
-            "Change part of a text file by replacing an exact piece of text. The user must approve the change.",
+            "Change part of a text file by replacing an exact piece of text. The user sees the change before it is made.",
             json!({
                 "path": { "type": "string" },
                 "find": { "type": "string", "description": "Exact text to replace; must appear exactly once" },
@@ -118,19 +220,78 @@ must approve.",
             "Search the web and get the top results: title, link and a short snippet.",
             json!({ "query": { "type": "string" } }),
             &["query"]),
+        tool("run_command",
+            "Run a terminal command (bash) on the user's computer and get its output: update or install apps, check the \
+system, anything the terminal can do. The user sees the command and approves it first. No keyboard input reaches it.",
+            json!({
+                "command": { "type": "string", "description": "The command, like flatpak update -y" },
+                "why": { "type": "string", "description": "One short sentence for the user on what it does" },
+            }),
+            &["command", "why"]),
         tool("open",
             "Open a file or folder in its usual app, or a web link in the browser, for the user to see.",
             json!({ "target": { "type": "string", "description": "A path or an http(s) link" } }),
             &["target"]),
-    ])
+    ]);
+    if mode == Mode::Plan {
+        if let Some(list) = all.as_array_mut() {
+            list.retain(|t| !WRITE_TOOLS.contains(&t.pointer("/function/name").and_then(Value::as_str).unwrap_or("")));
+        }
+    }
+    all
 }
 
+static STEPS: AtomicU64 = AtomicU64::new(0);
+
 /// Runs one tool call. Failures come back as text for the model to read, so it
-/// can correct itself or tell the user.
-pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value) -> String {
+/// can correct itself or tell the user. Each call is a step in the work view.
+pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value, mode: Mode) -> String {
     let arg = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
     let part = args.get("part").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
-    let result = match name {
+    let step = STEPS.fetch_add(1, Ordering::SeqCst) + 1;
+    let target = ["path", "query", "url", "target"].iter().map(|k| arg(k)).find(|v| !v.is_empty()).unwrap_or_default();
+    let shown = if target.starts_with("http") || !(name.contains("file") || name.contains("edit") || name == "list_folder") {
+        target.clone()
+    } else {
+        file_name(&target)
+    };
+    let _ = app.emit_to(
+        WINDOW_LABEL,
+        "agent-step",
+        json!({ "id": step, "tool": name, "target": shown, "path": target, "state": "running" }),
+    );
+    let text = if mode == Mode::Plan && WRITE_TOOLS.contains(&name) {
+        format!("{PLAN_REFUSAL} Describe this change in your plan instead.")
+    } else {
+        run_tool(app, name, args, step, mode, &arg, part).await.unwrap_or_else(|e| format!("Error: {e}"))
+    };
+    let state = if text.starts_with("Error:") || text.starts_with("Failed with exit code") || text.starts_with("Stopped") {
+        "failed"
+    } else if text.starts_with(DECLINED) {
+        "declined"
+    } else if text.starts_with(PLAN_REFUSAL) {
+        "skipped"
+    } else {
+        "done"
+    };
+    let mut done = json!({ "id": step, "state": state });
+    if state == "done" && !WRITE_TOOLS.contains(&name) && name != "open" {
+        done["lines"] = json!(preview::excerpt(&text, EXCERPT_LINES));
+    }
+    let _ = app.emit_to(WINDOW_LABEL, "agent-step", done);
+    text
+}
+
+async fn run_tool<R: Runtime>(
+    app: &AppHandle<R>,
+    name: &str,
+    args: &Value,
+    step: u64,
+    mode: Mode,
+    arg: &(dyn Fn(&str) -> String + Sync),
+    part: usize,
+) -> Result<String, String> {
+    match name {
         "search_files" => {
             activity(app, format!("Searching for “{}”…", arg("query")));
             search_files(arg("query"), arg("folder")).await
@@ -145,12 +306,13 @@ pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value) -> St
         }
         "create_file" => {
             let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
-            create_file(app, &arg("path"), file_body(args), &arg("sheet"), overwrite).await
+            create_file(app, (step, mode), &arg("path"), file_body(args), &arg("sheet"), overwrite).await
         }
-        "edit_spreadsheet" => edit_spreadsheet(app, &arg("path"), &arg("sheet"), args).await,
+        "edit_spreadsheet" => edit_spreadsheet(app, (step, mode), &arg("path"), &arg("sheet"), args).await,
+        "edit_document" => edit_document(app, (step, mode), &arg("path"), args).await,
         "edit_file" => {
             let get = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-            edit_file(app, &arg("path"), &get("find"), &get("replace")).await
+            edit_file(app, (step, mode), &arg("path"), &get("find"), &get("replace")).await
         }
         "read_web_page" => {
             activity(app, format!("Opening {}…", arg("url")));
@@ -160,10 +322,13 @@ pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value) -> St
             activity(app, format!("Searching the web for “{}”…", arg("query")));
             search_web(&arg("query")).await
         }
+        "run_command" => {
+            let raw = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            crate::shell::run_command(app, step, mode, &raw("command"), &raw("why")).await
+        }
         "open" => open(&arg("target")),
         other => Err(format!("There is no tool called {other}.")),
-    };
-    result.unwrap_or_else(|e| format!("Error: {e}"))
+    }
 }
 
 fn activity<R: Runtime>(app: &AppHandle<R>, text: String) {
@@ -399,7 +564,13 @@ async fn read_file(path: String, part: usize) -> Result<String, String> {
             let page = pages.get(part - 1).ok_or_else(|| format!("The PDF has {} pages.", pages.len()))?;
             return Ok(format!("{label}, page {part} of {}:\n{}", pages.len(), extract::clip(page.trim(), PART_CHARS * 2)));
         }
-        let text = match ai::read_attachment(&file.to_string_lossy()) {
+        let is_docx = file.extension().is_some_and(|e| e.eq_ignore_ascii_case("docx"));
+        let attachment = if is_docx {
+            docx::open(&file).ok().map(|d| ai::Attachment::Text(d.numbered_text()))
+        } else {
+            ai::read_attachment(&file.to_string_lossy())
+        };
+        let text = match attachment {
             Some(ai::Attachment::Text(text)) => text,
             Some(ai::Attachment::Image { .. }) => return Ok(format!("{label} is an image; it can't be read as text.")),
             _ => return Err(format!("{label} can't be read as text.")),
@@ -482,6 +653,7 @@ fn csv_line(cells: &[String]) -> String {
 
 async fn create_file<R: Runtime>(
     app: &AppHandle<R>,
+    (step, mode): (u64, Mode),
     path: &str,
     body: FileBody,
     sheet: &str,
@@ -490,23 +662,35 @@ async fn create_file<R: Runtime>(
     let target = writable(path)?;
     let exists = target.exists();
     let is_xlsx = target.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx") || e.eq_ignore_ascii_case("xlsm"));
+    let is_docx = target.extension().is_some_and(|e| e.eq_ignore_ascii_case("docx"));
     if exists && is_xlsx {
         return Err(format!(
             "{} already exists. Change it with edit_spreadsheet, which keeps its formatting; rewriting it would lose that.",
             tilde(&target)
         ));
     }
+    if exists && is_docx {
+        return Err(format!(
+            "{} already exists. Change it with edit_document, which keeps its formatting; rewriting it would lose that.",
+            tilde(&target)
+        ));
+    }
     if exists && !overwrite {
         return Err(format!("{} already exists. Set overwrite to replace it.", tilde(&target)));
     }
-    let preview: String = match &body {
-        FileBody::Rows(rows) => rows.iter().take(10).map(|r| r.join("  |  ")).collect::<Vec<_>>().join("\n"),
-        FileBody::Text(text) => text.lines().take(12).collect::<Vec<_>>().join("\n"),
+    let ext = target.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let old = if exists { std::fs::read_to_string(&target).unwrap_or_default() } else { String::new() };
+    let preview = match &body {
+        FileBody::Rows(rows) if ext == "csv" && exists => {
+            let csv = rows.iter().map(|r| csv_line(r)).collect::<Vec<_>>().join("\n");
+            Preview::Text { lines: preview::text_diff(&old, &csv) }
+        }
+        FileBody::Rows(rows) => preview::new_table(if sheet.is_empty() { "Sheet1" } else { sheet }, rows, 40),
+        FileBody::Text(text) => Preview::Text { lines: preview::text_diff(&old, text) },
     };
-    let title = if exists { "Mochi wants to replace a file" } else { "Mochi wants to create a file" };
-    let detail = format!("{}\n\n{}", tilde(&target), extract::clip(&preview, 600));
-    if !ask(app, title, &detail).await {
-        return Ok("The user declined. Nothing was written.".into());
+    let title = if exists { "Replace the file" } else { "Create the file" };
+    if !approve(app, step, mode, title, &target, preview, exists).await {
+        return Ok(format!("{DECLINED} Nothing was written."));
     }
     let mut note = String::new();
     if exists {
@@ -514,7 +698,6 @@ async fn create_file<R: Runtime>(
         std::fs::copy(&target, &backup).map_err(|e| format!("Could not keep a backup: {e}"))?;
         note = format!(" The previous version is kept as {}.", tilde(&backup));
     }
-    let ext = target.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     match (body, ext.as_str()) {
         (FileBody::Rows(rows), "xlsx") => extract::write_rows_xlsx(&target, sheet, &rows)?,
         (FileBody::Rows(rows), "csv") => {
@@ -569,9 +752,82 @@ fn open_sheet<'a>(
     }
 }
 
+/// `C` or `3` as column 3.
+fn column_ref(value: &Value) -> Option<u32> {
+    if let Some(n) = value.as_u64() {
+        return (n > 0).then_some(n as u32);
+    }
+    let text = value.as_str()?.trim().to_uppercase();
+    if let Ok(n) = text.parse::<u32>() {
+        return (n > 0).then_some(n);
+    }
+    if text.is_empty() || !text.chars().all(|c| c.is_ascii_uppercase()) || text.len() > 3 {
+        return None;
+    }
+    Some(text.chars().fold(0u32, |n, c| n * 26 + (c as u32 - 'A' as u32 + 1)))
+}
+
+/// The rows and columns a spreadsheet change touches, as they read now.
+fn sheet_preview(
+    ws: &umya_spreadsheet::Worksheet,
+    rows: &[u32],
+    columns: &[u32],
+    cells: &[((u32, u32), String, String)],
+) -> Preview {
+    let width = ws.highest_column().max(columns.iter().copied().max().unwrap_or(1)).max(1);
+    let height = ws.highest_row().max(rows.iter().copied().max().unwrap_or(1)).max(1);
+    let mut touched_cols: Vec<u32> = columns.to_vec();
+    touched_cols.extend(cells.iter().map(|((c, _), _, _)| *c));
+    let mut touched_rows: Vec<u32> = rows.to_vec();
+    touched_rows.extend(cells.iter().map(|((_, r), _, _)| *r));
+    let show_cols = preview::pick(width, &touched_cols, 7);
+    let show_rows = preview::pick(height, &touched_rows, 10);
+    // As the sheet shows it: dates as dates, not day counts.
+    let value = |c: u32, r: u32| ws.cell((c, r)).map(|cell| cell.formatted_value()).unwrap_or_default();
+    let heads = show_cols
+        .iter()
+        .map(|c| match c {
+            Some(c) => Head {
+                label: preview::column_letters(*c),
+                mark: if columns.contains(c) { Mark::Removed } else { Mark::Same },
+            },
+            None => Head { label: "…".into(), mark: Mark::Gap },
+        })
+        .collect();
+    let lines = show_rows
+        .iter()
+        .map(|r| {
+            let Some(r) = *r else { return Row { label: String::new(), mark: Mark::Gap, cells: Vec::new() } };
+            let row_gone = rows.contains(&r);
+            let cells = show_cols
+                .iter()
+                .map(|c| {
+                    let Some(c) = *c else { return Cell { text: "…".into(), old: None, mark: Mark::Gap } };
+                    let old = value(c, r);
+                    if let Some((_, _, new)) = cells.iter().find(|((cc, rr), _, _)| (*cc, *rr) == (c, r)) {
+                        let mark = if old.is_empty() { Mark::Added } else { Mark::Changed };
+                        let old = (!old.is_empty()).then(|| preview::clip_cell(&old));
+                        return Cell { text: preview::clip_cell(new), old, mark };
+                    }
+                    let gone = row_gone || columns.contains(&c);
+                    Cell { text: preview::clip_cell(&old), old: None, mark: if gone { Mark::Removed } else { Mark::Same } }
+                })
+                .collect();
+            Row { label: r.to_string(), mark: if row_gone { Mark::Removed } else { Mark::Same }, cells }
+        })
+        .collect();
+    Preview::Table { sheet: ws.name().to_string(), columns: heads, rows: lines }
+}
+
 /// Changes a spreadsheet in place. create_file would rewrite it from bare
 /// values and lose its styles, column widths, merged cells and direction.
-async fn edit_spreadsheet<R: Runtime>(app: &AppHandle<R>, path: &str, sheet: &str, args: &Value) -> Result<String, String> {
+async fn edit_spreadsheet<R: Runtime>(
+    app: &AppHandle<R>,
+    (step, mode): (u64, Mode),
+    path: &str,
+    sheet: &str,
+    args: &Value,
+) -> Result<String, String> {
     let target = readable(path)?;
     writable(&target.to_string_lossy())?;
     let is_xlsx = target.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx") || e.eq_ignore_ascii_case("xlsm"));
@@ -589,6 +845,12 @@ async fn edit_spreadsheet<R: Runtime>(app: &AppHandle<R>, path: &str, sheet: &st
         .collect();
     rows.sort_unstable();
     rows.dedup();
+    let mut columns: Vec<u32> = Vec::new();
+    for value in args.get("delete_columns").and_then(Value::as_array).into_iter().flatten() {
+        columns.push(column_ref(value).ok_or_else(|| format!("{value} is not a column like C."))?);
+    }
+    columns.sort_unstable();
+    columns.dedup();
     let mut cells: Vec<((u32, u32), String, String)> = Vec::new();
     for entry in args.get("set_cells").and_then(Value::as_array).into_iter().flatten() {
         let name = entry.get("cell").and_then(Value::as_str).unwrap_or("");
@@ -600,37 +862,23 @@ async fn edit_spreadsheet<R: Runtime>(app: &AppHandle<R>, path: &str, sheet: &st
         };
         cells.push((at, name.trim().to_uppercase(), value));
     }
-    if rows.is_empty() && cells.is_empty() {
-        return Err("Say which rows to delete or which cells to set.".into());
-    }
-
-    // What the user approves: the rows as they read now, and each cell's change.
-    let detail = {
-        let mut book = umya_spreadsheet::reader::xlsx::read(&target).map_err(|e| format!("Could not open it: {e}"))?;
-        let ws = open_sheet(&mut book, sheet)?;
-        let width = ws.highest_column().max(1);
-        let mut lines = vec![tilde(&target), String::new()];
-        for r in &rows {
-            let values: Vec<String> = (1..=width)
-                .filter_map(|c| ws.cell((c, *r)).map(|cell| cell.value().to_string()))
-                .filter(|v| !v.trim().is_empty())
-                .collect();
-            lines.push(format!("Delete row {r}: {}", values.join("  |  ")));
-        }
-        for ((c, r), name, value) in &cells {
-            let old = ws.cell((*c, *r)).map(|cell| cell.value().to_string()).unwrap_or_default();
-            lines.push(if old.is_empty() { format!("{name}: {value}") } else { format!("{name}: {old} -> {value}") });
-        }
-        lines.join("\n")
-    };
-    if !ask(app, "Mochi wants to change a spreadsheet", &extract::clip(&detail, 900)).await {
-        return Ok("The user declined. The spreadsheet is unchanged.".into());
+    if rows.is_empty() && columns.is_empty() && cells.is_empty() {
+        return Err("Say which rows or columns to delete or which cells to set.".into());
     }
 
     let mut book = umya_spreadsheet::reader::xlsx::read(&target).map_err(|e| format!("Could not open it: {e}"))?;
+    let preview = sheet_preview(open_sheet(&mut book, sheet)?, &rows, &columns, &cells);
+    let drastic = rows.len() + columns.len() > AUTO_DELETE_LIMIT;
+    if !approve(app, step, mode, "Change the spreadsheet", &target, preview, drastic).await {
+        return Ok(format!("{DECLINED} The spreadsheet is unchanged."));
+    }
+
+    // Read again: the file may have changed while the change waited for a click.
+    let mut book = umya_spreadsheet::reader::xlsx::read(&target).map_err(|e| format!("Could not open it: {e}"))?;
     let ws = open_sheet(&mut book, sheet)?;
-    // Cells first, at the row numbers the model read; then rows, bottom up, so
-    // each deletion leaves the numbers above it as they were.
+    // Cells first, at the row numbers the model read; then rows bottom up and
+    // columns right to left, so each deletion leaves the numbers before it as
+    // they were.
     for ((c, r), _, value) in &cells {
         let empty = ws.cell((*c, *r)).is_none_or(|cell| cell.value().is_empty());
         if empty && *r > 1 {
@@ -648,6 +896,9 @@ async fn edit_spreadsheet<R: Runtime>(app: &AppHandle<R>, path: &str, sheet: &st
     for r in rows.iter().rev() {
         extract::remove_row_keeping_formulas(ws, *r);
     }
+    for c in columns.iter().rev() {
+        extract::remove_column_keeping_formulas(ws, *c);
+    }
     let backup = backup_path(&target);
     std::fs::copy(&target, &backup).map_err(|e| format!("Could not keep a backup: {e}"))?;
     umya_spreadsheet::writer::xlsx::write(&book, &target).map_err(|e| format!("Could not save it: {e}"))?;
@@ -660,17 +911,87 @@ as {}.",
     ))
 }
 
-async fn edit_file<R: Runtime>(app: &AppHandle<R>, path: &str, find: &str, replace: &str) -> Result<String, String> {
+/// Changes a Word document in place, touching only the paragraphs and rows
+/// that change.
+async fn edit_document<R: Runtime>(app: &AppHandle<R>, (step, mode): (u64, Mode), path: &str, args: &Value) -> Result<String, String> {
+    let target = readable(path)?;
+    writable(&target.to_string_lossy())?;
+    if !target.extension().is_some_and(|e| e.eq_ignore_ascii_case("docx")) {
+        return Err("edit_document works on Word .docx files.".into());
+    }
+    let list = |key: &str| args.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+    let number = |v: &Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().trim_start_matches('¶').parse().ok()));
+    let text = |v: &Value, key: &str| match v.get(key) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    };
+    let mut edits = docx::Edits::default();
+    for v in list("delete_paragraphs") {
+        edits.delete_paragraphs.push(number(&v).ok_or_else(|| format!("{v} is not a paragraph number."))? as u32);
+    }
+    edits.delete_paragraphs.sort_unstable();
+    edits.delete_paragraphs.dedup();
+    for v in list("delete_table_rows") {
+        let (t, r) = (v.get("table").and_then(number), v.get("row").and_then(number));
+        match (t, r) {
+            (Some(t), Some(r)) if t > 0 && r > 0 => edits.delete_rows.push((t as u32, r as u32)),
+            _ => return Err(format!("{v} is not a table row like {{\"table\": 1, \"row\": 2}}.")),
+        }
+    }
+    edits.delete_rows.sort_unstable();
+    edits.delete_rows.dedup();
+    for v in list("replace") {
+        let paragraph = v.get("paragraph").and_then(number).map(|n| n as u32);
+        edits.replace.push((paragraph, text(&v, "find"), text(&v, "replace")));
+    }
+    for v in list("insert") {
+        let after = v.get("after").and_then(number).unwrap_or(0) as u32;
+        let lines = match v.get("lines") {
+            Some(Value::Array(lines)) => lines.iter().map(|l| l.as_str().map_or_else(|| l.to_string(), str::to_string)).collect(),
+            Some(Value::String(s)) => s.lines().map(str::to_string).collect(),
+            _ => Vec::new(),
+        };
+        edits.insert.push((after, lines));
+    }
+
+    let doc = docx::open(&target)?;
+    let plan = doc.plan(&edits)?;
+    let drastic = plan.deletions > AUTO_DELETE_LIMIT;
+    if !approve(app, step, mode, "Change the document", &target, plan.preview, drastic).await {
+        return Ok(format!("{DECLINED} The document is unchanged."));
+    }
+    // Planned again on the file as it is now, in case it changed meanwhile.
+    let plan = docx::open(&target)?.plan(&edits)?;
+    let backup = backup_path(&target);
+    std::fs::copy(&target, &backup).map_err(|e| format!("Could not keep a backup: {e}"))?;
+    docx::write(&target, &plan.xml)?;
+    Ok(format!(
+        "Changed {}. Paragraph numbers after the change have moved; read it again before another edit. The previous \
+version is kept as {}.",
+        tilde(&target),
+        tilde(&backup)
+    ))
+}
+
+async fn edit_file<R: Runtime>(
+    app: &AppHandle<R>,
+    (step, mode): (u64, Mode),
+    path: &str,
+    find: &str,
+    replace: &str,
+) -> Result<String, String> {
     let target = readable(path)?;
     writable(&target.to_string_lossy())?;
     if find.is_empty() {
         return Err("Say which text to replace.".into());
     }
-    let is_sheet = target
-        .extension()
-        .is_some_and(|e| ["xlsx", "xlsm"].iter().any(|x| e.eq_ignore_ascii_case(x)));
-    if is_sheet {
+    let ext = target.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if ext == "xlsx" || ext == "xlsm" {
         return Err("That is a spreadsheet: change it with edit_spreadsheet, which keeps its formatting.".into());
+    }
+    if ext == "docx" {
+        return Err("That is a Word document: change it with edit_document, which keeps its formatting.".into());
     }
     let text = std::fs::read_to_string(&target)
         .map_err(|_| format!("{} is not a text file, so it can't be edited here.", tilde(&target)))?;
@@ -679,16 +1000,14 @@ async fn edit_file<R: Runtime>(app: &AppHandle<R>, path: &str, find: &str, repla
         1 => {}
         n => return Err(format!("That text appears {n} times; include more around it so it is unique.")),
     }
-    let detail = format!(
-        "{}\n\n- {}\n+ {}",
-        tilde(&target),
-        extract::clip(find, 300).replace('\n', "\n- "),
-        extract::clip(replace, 300).replace('\n', "\n+ ")
-    );
-    if !ask(app, "Mochi wants to edit a file", &detail).await {
-        return Ok("The user declined. The file is unchanged.".into());
+    let changed = text.replacen(find, replace, 1);
+    let lines = preview::text_diff(&text, &changed);
+    let removed = lines.iter().filter(|l| l.mark == Mark::Removed).count();
+    let drastic = removed > AUTO_REMOVED_LINES;
+    if !approve(app, step, mode, "Edit the file", &target, Preview::Text { lines }, drastic).await {
+        return Ok(format!("{DECLINED} The file is unchanged."));
     }
-    std::fs::write(&target, text.replacen(find, replace, 1)).map_err(|e| e.to_string())?;
+    std::fs::write(&target, changed).map_err(|e| e.to_string())?;
     Ok(format!("Edited {}.", tilde(&target)))
 }
 
@@ -835,16 +1154,69 @@ pub fn decide<R: Runtime>(app: &AppHandle<R>, id: u64, allow: bool) {
     }
 }
 
-async fn ask<R: Runtime>(app: &AppHandle<R>, title: &str, detail: &str) -> bool {
+/// Shows a change in the work view and, when the mode says so, waits for the
+/// Allow / Deny click. No answer is a no.
+async fn approve<R: Runtime>(
+    app: &AppHandle<R>,
+    step: u64,
+    mode: Mode,
+    title: &str,
+    target: &Path,
+    preview: Preview,
+    drastic: bool,
+) -> bool {
+    let waiting = match mode {
+        Mode::Manual => true,
+        Mode::Auto => drastic,
+        Mode::AcceptEdits => false,
+        Mode::Plan => return false,
+    };
+    let file = file_name(&target.to_string_lossy());
+    present(app, step, mode, title, &file, &tilde(target), preview, waiting).await
+}
+
+/// Shows a change in the work view and waits for the click when `waiting`.
+#[allow(clippy::too_many_arguments)]
+pub async fn present<R: Runtime>(
+    app: &AppHandle<R>,
+    step: u64,
+    mode: Mode,
+    title: &str,
+    file: &str,
+    path: &str,
+    preview: Preview,
+    waiting: bool,
+) -> bool {
+    if mode == Mode::Plan {
+        return false;
+    }
     let approvals = app.state::<Approvals>();
     let id = approvals.next.fetch_add(1, Ordering::SeqCst) + 1;
-    let (tx, rx) = oneshot::channel();
-    approvals.pending.lock().unwrap().insert(id, tx);
-    let _ = app.emit_to(WINDOW_LABEL, "tool-approval", json!({ "id": id, "title": title, "detail": detail }));
-    // No answer is a no.
-    let allowed = matches!(tokio::time::timeout(APPROVAL_TIMEOUT, rx).await, Ok(Ok(true)));
+    let rx = waiting.then(|| {
+        let (tx, rx) = oneshot::channel();
+        approvals.pending.lock().unwrap().insert(id, tx);
+        rx
+    });
+    let _ = app.emit_to(
+        WINDOW_LABEL,
+        "agent-change",
+        json!({
+            "id": id,
+            "step": step,
+            "title": title,
+            "file": file,
+            "path": path,
+            "preview": preview,
+            "waiting": waiting,
+            "mode": mode.as_str(),
+        }),
+    );
+    let allowed = match rx {
+        Some(rx) => matches!(tokio::time::timeout(APPROVAL_TIMEOUT, rx).await, Ok(Ok(true))),
+        None => true,
+    };
     approvals.pending.lock().unwrap().remove(&id);
-    let _ = app.emit_to(WINDOW_LABEL, "tool-approval-done", json!({ "id": id }));
+    let _ = app.emit_to(WINDOW_LABEL, "agent-change-done", json!({ "id": id, "allowed": allowed }));
     allowed
 }
 

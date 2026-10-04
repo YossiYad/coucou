@@ -3,7 +3,6 @@
 // identically.
 
 import { h, svg, clear, dot } from "./dom";
-import { Bridge } from "../core/bridge";
 import { ICONS } from "./icons";
 import { Ticker } from "./ticker";
 import { State, providerName, type AgentTask } from "../core/state";
@@ -12,6 +11,7 @@ import { createMiniBot, pruneMiniBots } from "../mochi/minibots";
 import { buildPrompt } from "./chat";
 import { buildChoose, buildUpload, buildUploading } from "./upload";
 import { renderIntegrationCard, type IntegrationCardHooks } from "./integrations";
+import { buildWork } from "./work";
 
 export interface ViewActions {
   setView(v: IslandViewName): void;
@@ -102,8 +102,8 @@ export function buildHeader(actions: ViewActions): ViewHost {
     el,
     sync() {
       const v = State.view;
-      tabHome.classList.toggle("on", v === "overview" || v === "empty");
-      tabChat.classList.toggle("on", v === "prompt");
+      tabHome.classList.toggle("on", v === "overview" || v === "empty" || (v === "work" && State.work?.owner !== "chat"));
+      tabChat.classList.toggle("on", v === "prompt" || (v === "work" && State.work?.owner === "chat"));
       tabDrop.classList.toggle("on", v === "upload");
       gearBtn.classList.toggle("on", v === "settings");
       clear(gearBtn);
@@ -289,39 +289,6 @@ function buildEmpty(actions: ViewActions): ViewHost {
     el: h("div", { class: "view" }, card(null, body)),
     sync() {
       ask.firstElementChild!.textContent = `Ask ${providerName(State.settings)}`;
-    },
-  };
-}
-
-// ── Tool approval ─────────────────────────────────────────────────────────────
-
-/** The chat model wants to create or change a file: nothing is written until Allow. */
-function buildToolApproval(actions: ViewActions): ViewHost {
-  const title = h("div", { class: "title" });
-  const detail = h("div", {
-    class: "code",
-    dir: "auto",
-    style: "white-space:pre-wrap;max-height:96px;overflow:auto;text-overflow:clip",
-  });
-  const decide = (allow: boolean) => {
-    const pending = State.toolApproval;
-    if (!pending) return;
-    State.toolApproval = null;
-    State.isPinned = false;
-    void Bridge.toolDecision(pending.id, allow);
-    actions.setView("prompt");
-  };
-  const row = h(
-    "div",
-    { class: "actions" },
-    btn("Deny", "secondary", () => decide(false)),
-    btn("Allow", "primary", () => decide(true)),
-  );
-  return {
-    el: h("div", { class: "view" }, card("amber", stack(116, 16, title, detail, row))),
-    sync() {
-      title.textContent = State.toolApproval?.title ?? "";
-      detail.textContent = State.toolApproval?.detail ?? "";
     },
   };
 }
@@ -531,14 +498,14 @@ export function buildViews(
   map.set("overview", buildOverview(actions));
   map.set("empty", buildEmpty(actions));
   map.set("approval", buildApproval(actions));
-  map.set("toolApproval", buildToolApproval(actions));
+  map.set("work", buildWork(actions));
   map.set("question", buildQuestion());
   map.set("error", buildError(actions));
   map.set("finished", buildFinished(actions));
   map.set("confused", buildConfused());
   map.set("note", buildNote());
   map.set("settings", buildSettings(actions));
-  map.set("prompt", buildPrompt(onChatHeightChange));
+  map.set("prompt", buildPrompt(onChatHeightChange, actions));
   map.set("upload", buildUpload());
   map.set("uploading", buildUploading());
   map.set("choose", buildChoose(actions));

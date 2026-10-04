@@ -1,9 +1,12 @@
 // Coucou for Windows and Linux — app wiring and the commands the island calls.
 
+mod agent;
 mod ai;
 mod claude;
 mod clock;
+mod docx;
 mod extract;
+mod fallback;
 mod files;
 mod gemini;
 mod hooks;
@@ -12,6 +15,7 @@ mod island;
 mod local_llm;
 mod local_server;
 mod openai;
+mod preview;
 mod tools;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -21,6 +25,7 @@ mod log;
 mod pipe;
 mod secrets;
 mod settings;
+mod shell;
 mod tray;
 #[cfg(windows)]
 mod win_user;
@@ -316,6 +321,18 @@ fn tool_decision(app: AppHandle, id: u64, allow: bool) {
     tools::decide(&app, id, allow);
 }
 
+/// The work view's Stop button on a running command.
+#[tauri::command]
+fn stop_command(app: AppHandle, step: u64) {
+    shell::stop(&app, step);
+}
+
+/// What a Claude Code edit will do to its file, for the work view.
+#[tauri::command]
+fn change_preview(tool: String, input: serde_json::Value) -> Option<preview::Preview> {
+    preview::for_hook(&tool, &input)
+}
+
 /// The models a provider offers, asked from the provider with the stored key.
 /// `start` lets an explicit Refresh wake a local server that is off.
 #[tauri::command]
@@ -460,8 +477,11 @@ pub fn run() {
         .manage(Pending::default())
         .manage(Chat::default())
         .manage(tools::Approvals::default())
+        .manage(shell::Running::default())
         .invoke_handler(tauri::generate_handler![
             boot,
+            change_preview,
+            stop_command,
             save_settings,
             set_collapsed,
             set_island_rect,

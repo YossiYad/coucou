@@ -94,6 +94,15 @@ enum XmlKind {
     OpenDocument,
 }
 
+/// The words of a piece of Word XML, as `office` reads them.
+pub fn xml_text_word(xml: &str) -> String {
+    xml_text(xml, XmlKind::Word)
+}
+
+pub fn unescape_xml(text: &str) -> String {
+    unescape(text)
+}
+
 /// The words of a document's XML, with paragraph breaks kept.
 fn xml_text(xml: &str, kind: XmlKind) -> String {
     let xml = match kind {
@@ -282,6 +291,69 @@ pub fn remove_row_keeping_formulas(sheet: &mut umya_spreadsheet::Worksheet, row:
         sheet.cell_mut(at).set_formula(formula);
     }
     sheet.remove_row(row, 1);
+}
+
+/// Deletes a column without breaking formulas, the same way as rows: a range
+/// that starts on the deleted column is made to start right of it first.
+pub fn remove_column_keeping_formulas(sheet: &mut umya_spreadsheet::Worksheet, col: u32) {
+    let fixes: Vec<((u32, u32), String)> = sheet
+        .cells()
+        .into_iter()
+        .filter(|c| c.is_formula())
+        .filter_map(|c| {
+            let fixed = start_ranges_right_of(c.formula(), col);
+            (fixed != c.formula()).then(|| ((c.coordinate().col_num(), c.coordinate().row_num()), fixed))
+        })
+        .collect();
+    for (at, formula) in fixes {
+        sheet.cell_mut(at).set_formula(formula);
+    }
+    sheet.remove_column_by_index(col, 1);
+}
+
+fn column_number(letters: &str) -> Option<u32> {
+    if letters.is_empty() || letters.len() > 3 || !letters.chars().all(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    Some(letters.chars().fold(0, |n, c| n * 26 + (c as u32 - 'A' as u32 + 1)))
+}
+
+/// In ranges like C4:F4 or C:F whose first column is `col`, starts them a
+/// column to the right. Text in quotes is left alone.
+fn start_ranges_right_of(formula: &str, col: u32) -> String {
+    let chars: Vec<char> = formula.chars().collect();
+    let mut out = String::with_capacity(formula.len());
+    let mut quoted = false;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        if !quoted && c == ':' {
+            // The reference just before ':' - letters, an optional $, digits.
+            let digits = out.trim_end_matches(|d: char| d.is_ascii_digit()).len();
+            let letters_end = out[..digits].trim_end_matches('$').len();
+            let letters_start = out[..letters_end].trim_end_matches(|l: char| l.is_ascii_uppercase()).len();
+            let letters = out[letters_start..letters_end].to_string();
+            // Not the tail of a longer name, like a function or a sheet.
+            let standalone = out[..letters_start]
+                .trim_end_matches('$')
+                .chars()
+                .last()
+                .is_none_or(|p| !(p.is_ascii_alphanumeric() || p == '_' || p == '.'));
+            let rest: String = chars[i + 1..].iter().collect();
+            let end_letters: String = rest.trim_start_matches('$').chars().take_while(|l| l.is_ascii_uppercase()).collect();
+            let first = column_number(&letters);
+            let last = column_number(&end_letters);
+            if standalone && first == Some(col) && last.is_some_and(|l| l > col) {
+                let tail = out[letters_end..].to_string();
+                out.truncate(letters_start);
+                out.push_str(&crate::preview::column_letters(col + 1));
+                out.push_str(&tail);
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// In ranges like F4:F33 whose first row is `row`, starts them a row lower.
@@ -664,6 +736,17 @@ mod tests {
         assert_eq!(start_ranges_below("SUM(F4:F33)", 7), "SUM(F4:F33)");
         assert_eq!(start_ranges_below("SUM(F4:F4)", 4), "SUM(F4:F4)");
         assert_eq!(start_ranges_below("IF(C4=\"4:5\",SUM(A4:A9),0)", 4), "IF(C4=\"4:5\",SUM(A5:A9),0)");
+    }
+
+    #[test]
+    fn ranges_starting_on_a_deleted_column_start_right_of_it() {
+        assert_eq!(start_ranges_right_of("SUM(C4:F4)", 3), "SUM(D4:F4)");
+        assert_eq!(start_ranges_right_of("SUM($C$4:$F$4)", 3), "SUM($D$4:$F$4)");
+        assert_eq!(start_ranges_right_of("SUM(C:F)", 3), "SUM(D:F)");
+        assert_eq!(start_ranges_right_of("Sheet2!C1:E1", 3), "Sheet2!D1:E1");
+        assert_eq!(start_ranges_right_of("SUM(C4:F4)", 4), "SUM(C4:F4)");
+        assert_eq!(start_ranges_right_of("SUM(C4:C9)", 3), "SUM(C4:C9)");
+        assert_eq!(start_ranges_right_of("IF(A1=\"C1:D1\",1,0)", 3), "IF(A1=\"C1:D1\",1,0)");
     }
 
     #[test]

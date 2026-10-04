@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::settings::Settings;
-use crate::{claude, extract, gemini, local_llm, openai};
+use crate::{agent, claude, extract, fallback, gemini, local_llm, openai};
 
 /// Text and code files are inlined; anything larger is skipped, as on macOS.
 const MAX_INLINE_TEXT: u64 = 200_000;
@@ -128,6 +128,8 @@ pub enum ChatContext {
 #[serde(rename_all = "camelCase")]
 pub struct ChatReply {
     pub text: String,
+    /// Set when another model answered because the chosen one could not.
+    pub note: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -217,7 +219,7 @@ pub async fn send<R: tauri::Runtime>(
         None => "(Reply in the same language I used in this message.)".to_string(),
     };
     let text = format!("{query}\n\n{hint}");
-    let acts = provider == Provider::Local && settings.tools_enabled;
+    let acts = settings.tools_enabled;
     let turn = UserTurn::new(text, if chat.is_empty() { context } else { None }, acts);
 
     // What was asked of whom, never the words themselves.
@@ -234,12 +236,33 @@ pub async fn send<R: tauri::Runtime>(
     let epoch = chat.epoch();
 
     let started = std::time::Instant::now();
-    let result = match provider {
-        Provider::Anthropic => claude::complete(&settings.model, &history).await,
-        Provider::OpenAi => openai::complete(&settings.openai_model, &history).await,
-        Provider::Gemini => gemini::complete(&settings.gemini_model, &history).await,
-        Provider::Local => local_llm::complete(app, settings, &history).await,
-    };
+    let chosen = fallback::Target::new(provider, &chosen_model(provider, settings), 1);
+    let mut result = ask(app, &chosen, settings, &history, acts).await;
+    let mut note = None;
+    if let Err(err) = &result {
+        if settings.ai_fallback && fallback::worth_another(err) {
+            let first_error = err.clone();
+            let turns = fallback::transcript(&history);
+            for target in fallback::candidates(settings, &chosen, &fallback::accounts) {
+                crate::log::line(format!("chat: {} could not answer, asking {}", chosen.name(), target.name()));
+                let _ = tauri::Emitter::emit_to(app, crate::island::WINDOW_LABEL, "ai-fallback", serde_json::json!({ "name": target.name() }));
+                match ask(app, &target, settings, &fallback::rebuild(target.provider, &turns), acts).await {
+                    Ok(answer) => {
+                        note = Some(format!("{} answered because {} {}.", target.name(), chosen.name(), fallback::reason(&first_error)));
+                        // Kept in the chosen provider's format, so the conversation carries on there.
+                        result = Ok(fallback::adopt(answer, provider));
+                        break;
+                    }
+                    Err(e) => {
+                        crate::log::line(format!("chat: {} failed too: {e}", target.name()));
+                        if !fallback::worth_another(&e) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let secs = started.elapsed().as_secs_f32();
     // Cleared while the model was answering: the question is gone already.
     let current = chat.epoch() == epoch;
@@ -249,7 +272,7 @@ pub async fn send<R: tauri::Runtime>(
             if current {
                 chat.push(answer.stored);
             }
-            Ok(ChatReply { text: plain_text(&answer.text) })
+            Ok(ChatReply { text: plain_text(&answer.text), note })
         }
         Err(err) => {
             crate::log::line(format!("chat: failed after {secs:.0}s: {err}"));
@@ -258,6 +281,37 @@ pub async fn send<R: tauri::Runtime>(
             }
             Err(err)
         }
+    }
+}
+
+/// One provider and model answering the conversation as it is.
+async fn ask<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    target: &fallback::Target,
+    settings: &Settings,
+    history: &[Value],
+    acts: bool,
+) -> Result<Answer, String> {
+    let s = target.settings(settings);
+    let work = async {
+        match target.provider {
+            Provider::Local => local_llm::complete(app, &s, history).await,
+            cloud if acts => agent::run(app, cloud, &s, history).await,
+            Provider::Anthropic => claude::complete(&s.model, history).await,
+            Provider::OpenAi => openai::complete(&s.openai_model, history).await,
+            Provider::Gemini => gemini::complete(&s.gemini_model, history).await,
+        }
+    };
+    // Every request inside is made with this account's key.
+    crate::secrets::on_account(target.account, work).await
+}
+
+fn chosen_model(provider: Provider, settings: &Settings) -> String {
+    match provider {
+        Provider::Anthropic => settings.model.clone(),
+        Provider::OpenAi => settings.openai_model.clone(),
+        Provider::Gemini => settings.gemini_model.clone(),
+        Provider::Local => settings.local_model.clone(),
     }
 }
 

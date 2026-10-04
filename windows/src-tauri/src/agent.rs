@@ -1,0 +1,198 @@
+// The chat model acting with tools, whichever cloud model answers: it asks for
+// tool calls, Coucou runs them (each one a step in the work view, each change
+// shown before it is made) and hands back the results until the model answers.
+// The local model has its own loop in local_llm.rs, for its quirks, and shares
+// the prompt and the tools.
+
+use serde_json::Value;
+use tauri::{AppHandle, Runtime};
+
+use crate::ai::{Answer, Provider};
+use crate::settings::Settings;
+use crate::tools::{self, Mode};
+use crate::{claude, gemini, openai};
+
+/// Cloud models plan further ahead than the local one: a document edit is
+/// often read, read the next part, edit, check.
+const MAX_STEPS: usize = 20;
+
+/// One tool call, in every provider's terms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    pub id: String,
+    pub name: String,
+    pub args: Value,
+}
+
+/// What a provider answered: the final text, or tool calls to run. `assistant`
+/// is what goes back into the conversation for the next request.
+pub enum Turn {
+    Answer(Answer),
+    Calls { assistant: Vec<Value>, calls: Vec<Call> },
+}
+
+pub fn prompt(web_search: bool, mode: Mode) -> String {
+    let (y, mo, d, ..) = crate::clock::local_now();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut text = format!(
+        "{}\n\nYou can act on the user's computer with tools: find files, list folders, read files (long ones part by part, \
+PDFs page by page), create and change files (text, spreadsheets and Word documents, in place; the user sees every change), \
+read web pages and follow their links, search the web, and open files or links for the user. Use them whenever the answer \
+depends on the user's files or on current information, instead of guessing or saying you can't. When the user asks you to \
+do something (create, change, delete, find, open, look up), do it with the tools rather than explaining how, then say \
+briefly what you did. A file the user dropped comes with the place it was dropped from: read or change it there. Read a \
+file before changing it, and use the row, column and paragraph numbers read_file shows. The user's home folder is {home}; \
+their desktop is {home}/Desktop and their documents are in {home}/Documents. Today is {y:04}-{mo:02}-{d:02}. Read only as \
+much of a long file as the question needs.",
+        crate::ai::system_prompt(web_search)
+    );
+    text.push_str("\n\n");
+    text.push_str(&crate::shell::system_note());
+    if mode == Mode::Plan {
+        text.push_str(
+            "\n\nPlan mode is on: you cannot change anything now. Read what you need, then answer with a short numbered plan \
+of exactly what you would change (which file, which rows, columns or paragraphs, what text) and ask the user to approve \
+it. Never say you have changed anything.",
+        );
+    }
+    text
+}
+
+/// One chat turn with tools, for Claude, OpenAI and Gemini.
+pub async fn run<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: Provider,
+    settings: &Settings,
+    history: &[Value],
+) -> Result<Answer, String> {
+    let mode = Mode::parse(&settings.permission_mode);
+    let definitions = tools::definitions(mode);
+    // Gemini's own search costs a quota a free key runs out of; it searches
+    // through the search_web tool instead.
+    let system = prompt(matches!(provider, Provider::Anthropic | Provider::OpenAi), mode);
+    let mut messages = history.to_vec();
+    let mut used: Vec<String> = Vec::new();
+
+    for _ in 0..MAX_STEPS {
+        let step = match provider {
+            Provider::Anthropic => claude::step(&settings.model, &system, &messages, &definitions).await,
+            Provider::OpenAi => openai::step(&settings.openai_model, &system, &messages, &definitions).await,
+            Provider::Gemini => gemini::step(&settings.gemini_model, &system, &messages, &definitions).await,
+            Provider::Local => return Err("The local model runs its own loop.".into()),
+        };
+        let turn = match step {
+            Ok(turn) => turn,
+            Err(err) if used.is_empty() => return Err(err),
+            // Files may already have changed: say so, and keep it in the
+            // conversation, rather than an error that drops the whole turn.
+            Err(err) => {
+                let text = format!("I could not finish: {err}\n\nWhat was already done stays done: {}.", used.join("; "));
+                crate::log::line("agent: stopped after using tools");
+                return Ok(Answer { stored: crate::fallback::stored_text(provider, &text), text });
+            }
+        };
+        match turn {
+            Turn::Answer(mut answer) => {
+                if used.is_empty() {
+                    crate::log::line("agent: answered without using tools");
+                } else {
+                    // The next turn sees what was done, not every intermediate call.
+                    let text = format!("{}\n\n[Tools used: {}]", answer.text, used.join("; "));
+                    answer.stored = crate::fallback::stored_text(provider, &text);
+                }
+                return Ok(answer);
+            }
+            Turn::Calls { assistant, calls } => {
+                messages.extend(assistant);
+                if calls.is_empty() {
+                    continue; // a paused server-side search, picked up again
+                }
+                let mut outputs = Vec::with_capacity(calls.len());
+                for call in &calls {
+                    let output = tools::run(app, &call.name, &call.args, mode).await;
+                    let outcome = if output.starts_with("Error:") { output.as_str() } else { "ok" };
+                    crate::log::line(format!("tool: {} {} -> {outcome}", call.name, summary(&call.args)));
+                    used.push(format!("{} {}", call.name, summary(&call.args)));
+                    outputs.push(output);
+                }
+                messages.extend(results(provider, &calls, &outputs));
+            }
+        }
+    }
+    Err("That took too many steps. Try asking for something narrower.".into())
+}
+
+fn results(provider: Provider, calls: &[Call], outputs: &[String]) -> Vec<Value> {
+    match provider {
+        Provider::Anthropic => claude::tool_results(calls, outputs),
+        Provider::OpenAi => openai::tool_results(calls, outputs),
+        _ => gemini::tool_results(calls, outputs),
+    }
+}
+
+
+/// The function definitions alone, out of the OpenAI chat format the tools
+/// are written in: (name, description, JSON schema).
+pub fn functions(definitions: &Value) -> Vec<(String, String, Value)> {
+    definitions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            Some((
+                f.get("name")?.as_str()?.to_string(),
+                f.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
+                f.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+            ))
+        })
+        .collect()
+}
+
+/// A call's arguments, whether they arrive as an object or as JSON text.
+pub fn arguments(raw: Option<&Value>) -> Value {
+    match raw {
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({})),
+        Some(v @ Value::Object(_)) => v.clone(),
+        _ => serde_json::json!({}),
+    }
+}
+
+/// What a call was about, for the log and the conversation: paths and queries,
+/// never file contents.
+pub fn summary(args: &Value) -> String {
+    ["path", "query", "url", "target"]
+        .iter()
+        .filter_map(|k| args.get(*k).and_then(Value::as_str))
+        .map(|v| v.chars().take(80).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_mode_offers_only_the_tools_that_read() {
+        let names = |mode| functions(&tools::definitions(mode)).into_iter().map(|f| f.0).collect::<Vec<_>>();
+        let all = names(Mode::Manual);
+        assert!(all.contains(&"edit_document".to_string()));
+        assert!(all.contains(&"edit_spreadsheet".to_string()));
+        let plan = names(Mode::Plan);
+        assert!(plan.contains(&"read_file".to_string()));
+        for write in ["create_file", "edit_spreadsheet", "edit_document", "edit_file"] {
+            assert!(!plan.contains(&write.to_string()), "{write} offered in plan mode");
+        }
+        assert!(prompt(false, Mode::Plan).contains("Plan mode is on"));
+        assert!(!prompt(false, Mode::Manual).contains("Plan mode is on"));
+    }
+
+    #[test]
+    fn arguments_come_as_objects_or_json_text() {
+        assert_eq!(arguments(Some(&serde_json::json!("{\"path\":\"a\"}"))), serde_json::json!({ "path": "a" }));
+        assert_eq!(arguments(Some(&serde_json::json!({ "path": "a" }))), serde_json::json!({ "path": "a" }));
+        assert_eq!(arguments(Some(&serde_json::json!("not json"))), serde_json::json!({}));
+        assert_eq!(arguments(None), serde_json::json!({}));
+    }
+}

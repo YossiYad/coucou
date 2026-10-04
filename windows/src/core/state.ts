@@ -32,6 +32,8 @@ export interface ChatMessage {
   id: number;
   role: "user" | "assistant";
   content: string;
+  /** Another model answered because the chosen one could not. */
+  note?: string;
 }
 
 export type PromptContext =
@@ -105,15 +107,84 @@ export interface Settings {
   localStopCommand: string;
   /** Start a fresh conversation every time the island hides. */
   clearChatOnHide: boolean;
-  /** Let a local model act: search, read and create files, browse the web. */
+  /** Let the chat model act: search, read and change files, browse the web. */
   toolsEnabled: boolean;
+  /** Who approves the chat model's changes. */
+  permissionMode: PermissionMode;
+  /** When the chosen model cannot answer, ask another model or account. */
+  aiFallback: boolean;
 }
 
-/** A change the model wants to make, waiting for Allow / Deny. */
-export interface ToolApproval {
+export type PermissionMode = "manual" | "auto" | "acceptEdits" | "plan";
+
+/** Claude Code's modes, as they apply to the chat model's changes. */
+export const PERMISSION_MODES: { id: PermissionMode; label: string; hint: string }[] = [
+  { id: "manual", label: "Manual", hint: "Always ask before making changes" },
+  { id: "auto", label: "Auto", hint: "Ask only before drastic changes" },
+  { id: "acceptEdits", label: "Accept edits", hint: "Make every change, keep a backup" },
+  { id: "plan", label: "Plan", hint: "Change nothing, propose a plan" },
+];
+
+// ── Work view: an agent's steps and the change it is making ─────────────────
+
+export type Mark = "same" | "removed" | "added" | "changed" | "gap";
+
+export interface DiffLine {
+  old: number | null;
+  new: number | null;
+  mark: Mark;
+  text: string;
+}
+
+export type Preview =
+  | { kind: "text"; lines: DiffLine[] }
+  | {
+      kind: "table";
+      sheet: string;
+      columns: { label: string; mark: Mark }[];
+      rows: { label: string; mark: Mark; cells: { text: string; old: string | null; mark: Mark }[] }[];
+    }
+  | { kind: "doc"; blocks: { label: string; mark: Mark; text: string; old: string | null }[] };
+
+export type StepState = "running" | "done" | "failed" | "declined" | "skipped" | "waiting";
+
+export interface WorkStep {
   id: number;
-  title: string;
-  detail: string;
+  tool: string;
+  target: string;
+  state: StepState;
+}
+
+/** What the work view's panel shows: a change, or what was just read or run. */
+export interface WorkPanel {
+  file: string;
+  path: string;
+  preview: Preview;
+  /** An approval waiting for Allow / Deny (the chat model's change id). */
+  approvalId?: number;
+  /** Claude Code's own permission request, answered through the hook. */
+  hookRequestId?: string;
+  /** The chat model's step this change belongs to. */
+  stepId?: number;
+  /** A command's step, while its output streams in; Stop ends it. */
+  commandStep?: number;
+  /** The chat model's change this panel shows, to match its outcome. */
+  changeId?: number;
+  /** Done: the change was made ("applied") or refused ("declined"). */
+  outcome?: "applied" | "declined";
+  note?: string;
+}
+
+export interface WorkSession {
+  /** "chat" for the chat model, or the agent pill it belongs to. */
+  owner: string;
+  who: string;
+  sub: string;
+  steps: WorkStep[];
+  panel: WorkPanel | null;
+  active: boolean;
+  /** performance.now() of the last event, to let a finished session fade. */
+  at: number;
 }
 
 export type Provider = "anthropic" | "openai" | "gemini" | "local";
@@ -153,6 +224,8 @@ export const DEFAULT_SETTINGS: Settings = {
   localStopCommand: "",
   clearChatOnHide: false,
   toolsEnabled: false,
+  permissionMode: "manual",
+  aiFallback: true,
 };
 
 type Listener = () => void;
@@ -185,8 +258,10 @@ class AppState {
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
   pendingApproval: ApprovalInfo | null = null;
-  /** A file change the chat model asked for, awaiting a click. */
-  toolApproval: ToolApproval | null = null;
+  /** The chat model's or Claude Code's steps and current change. */
+  work: WorkSession | null = null;
+  /** The mode the chat ran in when it last answered, for "Go ahead" after a plan. */
+  answeredInPlan = false;
   /** What the chat model is doing right now: "Reading report.pdf…". */
   toolActivity: string | null = null;
   /** The user is typing in the chat, or waiting for its answer. */
@@ -320,6 +395,9 @@ class AppState {
   }
 
   defaultView(): IslandViewName {
+    // An agent at work is what the island opens on, like the overview would.
+    const work = this.work;
+    if (work?.active && (work.owner === "chat" || work.owner === this.focusId)) return "work";
     return this.tasks.length === 0 ? "empty" : "overview";
   }
 }

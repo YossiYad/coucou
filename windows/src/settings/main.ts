@@ -4,10 +4,12 @@
 
 import "./settings.css";
 import { Bridge, onEvent, type HookStatus, type ModelInfo } from "../core/bridge";
-import { DEFAULT_SETTINGS, type Provider, type Settings } from "../core/state";
+import { DEFAULT_SETTINGS, PERMISSION_MODES, type PermissionMode, type Provider, type Settings } from "../core/state";
 import { h, clear } from "../views/dom";
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
+/** Puts the permission mode chosen in the island into the select. */
+let syncMode = () => {};
 let version = "";
 /** Where API keys live on this platform, for the wording only. */
 let keyStore = "the Windows Credential Manager";
@@ -252,6 +254,81 @@ function aiSection(): HTMLElement {
   const clearKey = h("button", { class: "danger", text: "Remove" });
   const keyRow = h("div", { class: "row" }, h("label", { text: "API key" }), keyField, saveKey, clearKey);
 
+  // Keys from the user's other accounts with the same provider, stored as
+  // <key>-2 ... <key>-5 and tried in turn when one runs out.
+  const extraField = h("input", {
+    type: "password", style: grow, autocomplete: "off", spellcheck: "false",
+  }) as HTMLInputElement;
+  const addExtra = h("button", { text: "Add key" });
+  const clearExtra = h("button", { class: "danger", text: "Remove them" });
+  const extraRow = h(
+    "div",
+    {},
+    h("div", { class: "row" }, h("label", { text: "Other accounts" }), extraField, addExtra, clearExtra),
+    h("div", {
+      class: "hint",
+      text: "Keys from your other accounts with the same provider, up to four. When one account's quota runs out, the next one answers.",
+    }),
+  );
+  const extraSlots = [2, 3, 4, 5];
+  const extraName = (base: string, slot: number) => `${base}-${slot}`;
+  async function storedExtras(base: string): Promise<number[]> {
+    const found: number[] = [];
+    for (const slot of extraSlots) if ((await Bridge.secretPresent(extraName(base, slot))) ?? false) found.push(slot);
+    return found;
+  }
+  async function showExtras() {
+    const p = current();
+    if (!p.key) return;
+    const found = await storedExtras(p.key);
+    extraField.placeholder = found.length
+      ? `${found.length} more key${found.length > 1 ? "s" : ""} stored; paste another to add it`
+      : "Paste a key from another account";
+    clearExtra.style.display = found.length ? "" : "none";
+    addExtra.toggleAttribute("disabled", found.length >= extraSlots.length);
+  }
+  addExtra.addEventListener("click", async () => {
+    const p = current();
+    const value = extraField.value.trim();
+    if (!value || !p.key) return;
+    const found = await storedExtras(p.key);
+    const free = extraSlots.find((s) => !found.includes(s));
+    if (free == null) return;
+    try {
+      await Bridge.secretSet(extraName(p.key, free), value);
+      extraField.value = "";
+      note("ok", "Added. It never touches disk.");
+      await showExtras();
+    } catch (err) {
+      note("err", `Could not save: ${String(err)}`);
+    }
+  });
+  clearExtra.addEventListener("click", async () => {
+    const p = current();
+    if (!p.key) return;
+    try {
+      for (const slot of extraSlots) await Bridge.secretClear(extraName(p.key, slot));
+      note("ok", "The other accounts' keys are removed.");
+      await showExtras();
+    } catch (err) {
+      note("err", `Could not remove: ${String(err)}`);
+    }
+  });
+
+  const fallbackToggle = toggle(settings.aiFallback, (on) => {
+    settings.aiFallback = on;
+    void save();
+  });
+  const fallbackRow = h(
+    "div",
+    {},
+    h("div", { class: "row" }, h("label", { text: "If it can't answer" }), fallbackToggle),
+    h("div", {
+      class: "hint",
+      text: "When the chosen model can't answer (quota used up, overloaded, offline, no key), ask the next one: the same model on your other accounts, then a lighter Gemini model, then the other providers you have keys for, and the local model last.",
+    }),
+  );
+
   const urlField = h("input", {
     type: "text", style: grow, spellcheck: "false", placeholder: "http://localhost:11434",
   }) as HTMLInputElement;
@@ -278,11 +355,24 @@ function aiSection(): HTMLElement {
     settings.toolsEnabled = on;
     void save();
   });
-  lifecycle.append(
+  const modeSelect = h("select", {}) as HTMLSelectElement;
+  for (const m of PERMISSION_MODES) modeSelect.append(h("option", { value: m.id, text: m.label }));
+  modeSelect.value = settings.permissionMode;
+  modeSelect.addEventListener("change", () => {
+    settings.permissionMode = modeSelect.value as PermissionMode;
+    void save();
+  });
+  syncMode = () => {
+    modeSelect.value = settings.permissionMode;
+  };
+  const acting = h(
+    "div",
+    {},
     h("div", { class: "row" }, h("label", { text: "Let it act" }), toolsToggle),
+    h("div", { class: "row" }, h("label", { text: "Changes" }), modeSelect),
     h("div", {
       class: "hint",
-      text: "Find, read and create files in your home folder, read web pages and search the web (through DuckDuckGo). Hidden files stay off limits, and nothing is written until you click Allow. Needs a model that can use tools, such as qwen3; others just chat.",
+      text: "Find, read and change files in your home folder (text, spreadsheets and Word documents, in place), read web pages and search the web. Hidden files stay off limits. Every change shows as a diff first; Manual waits for Allow, Auto asks only before drastic changes, Accept edits never asks (a backup is kept), Plan changes nothing and proposes a plan. The mode can also be switched from the chat. Local models need tool support, such as qwen3.",
     }),
   );
 
@@ -379,6 +469,8 @@ function aiSection(): HTMLElement {
   function showProvider() {
     const p = current();
     keyRow.style.display = p.key ? "" : "none";
+    extraRow.style.display = p.key ? "" : "none";
+    void showExtras();
     urlRow.style.display = p.key ? "none" : "";
     lifecycle.style.display = p.key ? "none" : "";
     urlField.value = settings.localUrl;
@@ -463,11 +555,14 @@ function aiSection(): HTMLElement {
     state,
     h("div", { class: "row" }, h("label", { text: "Provider" }), provider),
     keyRow,
+    extraRow,
     urlRow,
     h("div", { class: "row" }, h("label", { text: "Model" }), model, refresh),
     lifecycle,
     customRow,
     h("div", { class: "row" }, h("label", { text: "When it hides" }), onHide),
+    fallbackRow,
+    acting,
     feedback,
   );
 }
@@ -670,6 +765,7 @@ async function main() {
 
   void onEvent<Settings>("settings-changed", (s) => {
     settings = { ...settings, ...s };
+    syncMode();
   });
 }
 

@@ -8,7 +8,7 @@ export type IslandViewName =
   | "overview"
   | "empty"
   | "approval"
-  | "toolApproval"
+  | "work"
   | "question"
   | "error"
   | "finished"
@@ -71,7 +71,8 @@ export const VIEW_LAYOUTS: Record<IslandViewName, ViewLayout> = {
   overview: { height: 160, botX: 68, botY: null, botDiameter: 58, agentMode: "pills" },
   empty: { height: 160, botX: 70, botY: null, botDiameter: 62, agentMode: "none" },
   approval: { height: 160, botX: 62, botY: null, botDiameter: 56, agentMode: "column" },
-  toolApproval: { height: 200, botX: 62, botY: null, botDiameter: 56, agentMode: "none" },
+  // Mochi tops the left column, above the agent's name and steps.
+  work: { height: 292, botX: 74, botY: 84, botDiameter: 54, agentMode: "none" },
   question: { height: 160, botX: 62, botY: null, botDiameter: 56, agentMode: "column" },
   error: { height: 160, botX: 62, botY: null, botDiameter: 58, agentMode: "column" },
   finished: { height: 160, botX: 62, botY: null, botDiameter: 58, agentMode: "column" },

@@ -5,7 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import type { Settings } from "./state";
+import type { Preview, Settings } from "./state";
 
 export const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -83,10 +83,15 @@ export const Bridge = {
   // ── Chat, files, secrets ──────────────────────────────────────────────────
   /** One chat turn. The API key and any file bytes never leave Rust. */
   chatSend: (query: string, context: ChatContext | null) =>
-    callOrThrow<{ text: string }>("chat_send", { query, context }),
+    callOrThrow<{ text: string; note: string | null }>("chat_send", { query, context }),
   chatReset: () => call<void>("chat_reset"),
   /** The models a provider offers, asked from the provider itself. */
   aiModels: (provider: string, start = false) => callOrThrow<ModelInfo[]>("ai_models", { provider, start }),
+  /** Ends a command the chat model is running. */
+  stopCommand: (step: number) => call<void>("stop_command", { step }),
+  /** What a Claude Code edit will do to its file, as a diff. */
+  changePreview: (tool: string, input: Record<string, unknown>) =>
+    call<Preview | null>("change_preview", { tool, input }),
   /** Allow / Deny a file change the chat model asked for. */
   toolDecision: (id: number, allow: boolean) => call<void>("tool_decision", { id, allow }),
   /** Copies a dropped file into the inbox. */

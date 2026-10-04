@@ -112,10 +112,15 @@ async fn agent<R: Runtime>(
     model: &str,
     history: &[Value],
 ) -> Result<Option<Answer>, String> {
-    let mut messages = vec![json!({ "role": "system", "content": agent_prompt() })];
+    let mode = tools::Mode::parse(&settings.permission_mode);
+    let mut messages = vec![json!({ "role": "system", "content": crate::agent::prompt(false, mode) })];
     messages.extend_from_slice(history);
-    let definitions = tools::definitions();
+    let definitions = tools::definitions(mode);
     let mut used: Vec<String> = Vec::new();
+    // Whether the last tool call failed, and whether the model was already
+    // pushed once to act on what it announced.
+    let mut last_failed = false;
+    let mut nudged = false;
 
     for _ in 0..MAX_STEPS {
         // Qwen3 sometimes writes a tool call the server cannot parse, and the
@@ -157,6 +162,15 @@ async fn agent<R: Runtime>(
         let calls = message.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
         if calls.is_empty() {
             let mut answer = parse(&response)?;
+            // Qwen3 often answers a failed step with "Let me try another way"
+            // and stops there. Once per turn, it is told to go ahead.
+            if last_failed && !nudged && announces_more(&answer.text) {
+                nudged = true;
+                crate::log::line("agent: the model announced a step without taking it, asking it to");
+                messages.push(json!({ "role": "assistant", "content": answer.text }));
+                messages.push(json!({ "role": "user", "content": "Go ahead and do that now with the tools." }));
+                continue;
+            }
             if used.is_empty() {
                 crate::log::line("agent: answered without using tools");
             } else {
@@ -182,11 +196,12 @@ async fn agent<R: Runtime>(
                 Some(v) => v.clone(),
                 None => json!({}),
             };
-            let result = tools::run(app, name, &args).await;
+            let result = tools::run(app, name, &args, mode).await;
+            last_failed = result.starts_with("Error:") || result.starts_with("Failed with exit code");
             let outcome = if result.starts_with("Error:") { result.as_str() } else { "ok" };
-            crate::log::line(format!("tool: {name} {} -> {outcome}", summary(&args)));
+            crate::log::line(format!("tool: {name} {} -> {outcome}", crate::agent::summary(&args)));
             local_server::touch();
-            used.push(format!("{name} {}", summary(&args)));
+            used.push(format!("{name} {}", crate::agent::summary(&args)));
             let mut reply = json!({ "role": "tool", "name": name, "content": result });
             if let Some(id) = call.get("id") {
                 reply["tool_call_id"] = id.clone();
@@ -198,6 +213,15 @@ async fn agent<R: Runtime>(
 }
 
 /// No text and no tool call: what is left of a tool call the server could not parse.
+/// An answer that ends by saying what it will do next instead of doing it.
+fn announces_more(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let tail: String = lower.chars().rev().take(240).collect::<Vec<_>>().into_iter().rev().collect();
+    ["let me ", "i'll ", "i will ", "i'm going to ", "i am going to ", "אנסה", "אריץ", "אבדוק", "בוא נ"]
+        .iter()
+        .any(|p| tail.contains(p))
+}
+
 fn is_empty_reply(response: &Value) -> bool {
     let message = response.pointer("/choices/0/message");
     let text = message.and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("");
@@ -205,31 +229,7 @@ fn is_empty_reply(response: &Value) -> bool {
     strip_thinking(text).trim().is_empty() && !calls
 }
 
-fn agent_prompt() -> String {
-    let (y, mo, d, ..) = crate::clock::local_now();
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!(
-        "{}\n\nYou can act on the user's computer with tools: find files, list folders, read files (long ones part by part, \
-PDFs page by page), create and edit files (the user approves every change), read web pages and follow their links, \
-search the web, and open files or links for the user. Use them whenever the answer depends on the user's files or on \
-current information, instead of guessing or saying you can't. When the user asks you to do something (create, change, \
-find, open, look up), do it with the tools rather than explaining how, then say briefly what you did. A file the user \
-dropped comes with the place it was dropped from: read or change it there. The user's home folder is {home}; their desktop is \
-{home}/Desktop and their documents are in {home}/Documents. Today is {y:04}-{mo:02}-{d:02}. Read only as much of a \
-long file as the question needs.",
-        ai::system_prompt(false)
-    )
-}
 
-/// `read_file ~/Desktop/a.pdf`: enough for the next turn to know what was used.
-fn summary(args: &Value) -> String {
-    ["path", "query", "url", "target"]
-        .iter()
-        .filter_map(|k| args.get(*k).and_then(Value::as_str))
-        .map(|v| v.chars().take(80).collect::<String>())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 fn describe(err: &ai::ApiError, base: &str, settings: &Settings) -> String {
     if err.status != 0 {
@@ -301,6 +301,13 @@ pub async fn models(settings: &Settings, start: bool) -> Result<Vec<ModelInfo>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_announced_next_step_is_recognised() {
+        assert!(announces_more("It seems there was an issue. I'll use flatpak remote-ls instead. Let me proceed with that."));
+        assert!(announces_more("הפקודה נכשלה, אנסה דרך אחרת."));
+        assert!(!announces_more("Done: two Flatpak apps have updates, Firefox and Steam."));
+    }
 
     #[test]
     fn server_addresses_are_normalised() {

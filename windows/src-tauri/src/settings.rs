@@ -45,10 +45,26 @@ pub struct Settings {
     /// picking up where it left off.
     #[serde(default)]
     pub clear_chat_on_hide: bool,
-    /// Lets a local model that supports it act: search, read and create files,
-    /// browse the web. Every write still waits for a click.
+    /// Lets the chat model act: search, read and change files, browse the web.
     #[serde(default)]
     pub tools_enabled: bool,
+    /// Who approves the chat model's changes, like Claude Code's modes:
+    /// "manual" asks every time, "auto" asks only for drastic changes,
+    /// "acceptEdits" never asks, "plan" changes nothing and proposes instead.
+    #[serde(default = "default_permission_mode")]
+    pub permission_mode: String,
+    /// When the chosen model cannot answer (quota, overload, network, no
+    /// key), ask the next one this computer can use.
+    #[serde(default = "default_true")]
+    pub ai_fallback: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_permission_mode() -> String {
+    "manual".into()
 }
 
 fn default_model() -> String {
@@ -89,6 +105,8 @@ impl Default for Settings {
             local_stop_command: String::new(),
             clear_chat_on_hide: false,
             tools_enabled: false,
+            permission_mode: default_permission_mode(),
+            ai_fallback: true,
         }
     }
 }

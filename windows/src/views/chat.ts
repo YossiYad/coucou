@@ -5,8 +5,9 @@ import { h, svg, clear } from "./dom";
 import { ICONS } from "./icons";
 import { Bridge, type ChatContext } from "../core/bridge";
 import { Sound } from "../core/sound";
-import { State, type ChatMessage } from "../core/state";
-import type { ViewHost } from "./views";
+import { PERMISSION_MODES, State, type ChatMessage, type PermissionMode } from "../core/state";
+import { chatFinished } from "../island/work";
+import type { ViewActions, ViewHost } from "./views";
 
 let nextId = 1;
 
@@ -19,7 +20,9 @@ function bubble(message: ChatMessage): HTMLElement {
     );
   }
   // dir="auto": Hebrew or Arabic reads right to left, punctuation included.
-  return h("div", { class: "chat-row" }, h("div", { class: "reply", dir: "auto", text: message.content }));
+  const reply = h("div", { class: "reply", dir: "auto", text: message.content });
+  if (!message.note) return h("div", { class: "chat-row" }, reply);
+  return h("div", { class: "chat-row" }, h("div", {}, reply, h("div", { class: "reply-note", text: message.note })));
 }
 
 function typingDots(activity: string | null): HTMLElement {
@@ -41,7 +44,55 @@ function contextChip(label: string): HTMLElement {
   return chip;
 }
 
-export function buildPrompt(onHeightChange: () => void): ViewHost {
+/** Sets the permission mode and keeps it, like Claude Code's Shift+Tab. */
+function setMode(mode: PermissionMode) {
+  const current = State.settings.permissionMode;
+  if (current !== "plan") lastActingMode = current;
+  State.settings.permissionMode = mode;
+  void Bridge.saveSettings(State.settings);
+  State.notify();
+}
+
+/** Where "Go ahead" returns to after a plan. */
+let lastActingMode: PermissionMode = "manual";
+
+/** The mode button and its menu, listing the modes like Claude Code does. */
+function buildModePicker(): { button: HTMLElement; menu: HTMLElement; sync(): void } {
+  const label = h("span");
+  const button = h("button", { class: "mode-btn", title: "Who approves changes (Shift+Tab)" }, label);
+  const menu = h("div", { class: "mode-menu" });
+  const items = PERMISSION_MODES.map((m, i) => {
+    const item = h(
+      "button",
+      { class: "mode-item" },
+      h("span", { class: "mode-text" }, h("b", { text: m.label }), h("span", { text: m.hint })),
+      h("span", { class: "mode-check" }, svg(ICONS.check, 11)),
+      h("span", { class: "mode-key", text: String(i + 1) }),
+    );
+    item.addEventListener("mousedown", (e) => e.preventDefault()); // keep the input focused
+    item.addEventListener("click", () => {
+      setMode(m.id);
+      menu.classList.remove("open");
+    });
+    menu.append(item);
+    return item;
+  });
+  button.addEventListener("mousedown", (e) => e.preventDefault());
+  button.addEventListener("click", () => menu.classList.toggle("open"));
+  return {
+    button,
+    menu,
+    sync() {
+      const mode = State.settings.permissionMode;
+      label.textContent = PERMISSION_MODES.find((m) => m.id === mode)?.label ?? "Manual";
+      button.dataset.mode = mode;
+      button.style.display = State.settings.toolsEnabled ? "" : "none";
+      items.forEach((item, i) => item.classList.toggle("on", PERMISSION_MODES[i].id === mode));
+    },
+  };
+}
+
+export function buildPrompt(onHeightChange: () => void, actions: ViewActions): ViewHost {
   const chipRow = h("div", { class: "chip-row" });
   const log = h("div", { class: "chat-log" });
   const input = h("input", {
@@ -52,12 +103,21 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     dir: "auto",
   }) as HTMLInputElement;
   const send = h("button", { class: "send-btn", title: "Send" }, svg(ICONS.arrowUp, 11));
-  const bar = h("div", { class: "chat-bar" }, input, send);
+  const picker = buildModePicker();
+  const stepsBtn = h("button", { class: "steps-btn", title: "What it did", onclick: () => actions.setView("work") }, svg(ICONS.stack, 12));
+  const bar = h("div", { class: "chat-bar" }, picker.button, input, stepsBtn, send);
+  /** After a plan: run it in the mode used before Plan. */
+  const goAhead = h("button", { class: "go-ahead" }, h("span", { text: "Go ahead" }));
+  goAhead.addEventListener("click", () => {
+    setMode(lastActingMode);
+    input.value = "Go ahead with the plan.";
+    void submit();
+  });
 
   const el = h(
     "div",
     { class: "view" },
-    h("div", { class: "card wash chat-card" }, h("div", { class: "chat-body" }, chipRow, log, bar)),
+    h("div", { class: "card wash chat-card" }, h("div", { class: "chat-body" }, chipRow, log, bar), picker.menu),
   );
   (el.querySelector(".card") as HTMLElement).style.setProperty("--wash", "rgba(99,102,241,0.5)");
 
@@ -93,17 +153,23 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     // island hid): it then belongs to nothing on screen.
     const conversation = State.chatHistory;
     State.toolActivity = null;
+    const planning = State.settings.toolsEnabled && State.settings.permissionMode === "plan";
+    State.answeredInPlan = false;
     try {
       const reply = await Bridge.chatSend(query, context);
       State.stateOverride = null;
+      chatFinished();
+      if (State.view === "work") actions.setView("prompt");
       if (State.chatHistory === conversation) {
+        State.answeredInPlan = planning;
         // However long the wait, the answer gets a full close delay to be read.
         State.chatReadUntil = performance.now() + State.settings.autoCloseInterval * 1000;
-        State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text });
+        State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text, note: reply.note ?? undefined });
         Sound.play("finish");
       }
     } catch (err) {
       State.stateOverride = null;
+      chatFinished();
       if (State.chatHistory === conversation) {
         State.noteMessage = String(err).replace(/^Error:\s*/, "");
         State.view = "note";
@@ -121,9 +187,26 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
 
   send.addEventListener("click", () => void submit());
   input.addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key === "Enter") {
+    const key = e as KeyboardEvent;
+    if (key.key === "Enter") {
       e.preventDefault();
       void submit();
+    }
+    if (key.key === "Tab" && key.shiftKey && State.settings.toolsEnabled) {
+      // Shift+Tab cycles the modes, as in Claude Code.
+      e.preventDefault();
+      const i = PERMISSION_MODES.findIndex((m) => m.id === State.settings.permissionMode);
+      setMode(PERMISSION_MODES[(i + 1) % PERMISSION_MODES.length].id);
+    }
+    if (picker.menu.classList.contains("open") && /^[1-4]$/.test(key.key)) {
+      // The numbers the menu shows pick a mode, as in Claude Code.
+      e.preventDefault();
+      setMode(PERMISSION_MODES[Number(key.key) - 1].id);
+      picker.menu.classList.remove("open");
+    }
+    if (key.key === "Escape" && picker.menu.classList.contains("open")) {
+      e.preventDefault();
+      picker.menu.classList.remove("open");
     }
     e.stopPropagation(); // Escape closes the island, not the chat
   });
@@ -140,14 +223,19 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
       }
 
       const thinking = State.stateOverride === "thinking";
-      const key = `${State.chatHistory.length}|${thinking}|${thinking ? State.toolActivity ?? "" : ""}`;
+      const offerPlan = !thinking && State.answeredInPlan && State.chatHistory.at(-1)?.role === "assistant";
+      const key = `${State.chatHistory.length}|${thinking}|${thinking ? State.toolActivity ?? "" : ""}|${offerPlan}`;
       if (key !== renderedKey) {
         renderedKey = key;
         clear(log);
         for (const m of State.chatHistory) log.append(bubble(m));
         if (thinking) log.append(typingDots(State.toolActivity));
+        if (offerPlan) log.append(h("div", { class: "chat-row" }, goAhead));
         log.scrollTop = log.scrollHeight;
       }
+      picker.sync();
+      const work = State.work;
+      stepsBtn.style.display = work?.owner === "chat" && work.steps.length ? "" : "none";
 
       input.placeholder = State.chatHistory.length === 0 ? "Ask me anything…" : "Continue…";
       input.disabled = sending;

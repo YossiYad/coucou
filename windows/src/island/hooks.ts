@@ -8,6 +8,47 @@ import { Bridge, onEvent } from "../core/bridge";
 import { Sound } from "../core/sound";
 import { State } from "../core/state";
 import type { Island } from "./island";
+import { addStep, plain, session, setPanel, setStep, showWork } from "./work";
+
+/** Claude Code tools whose change can be shown as a diff before it lands. */
+const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
+let hookStep = 1_000_000;
+
+/** The work view's record of a Claude Code (or tagged agent) tool call. */
+function workStep(island: Island, agentId: string, who: string, payload: HookPayload) {
+  const tool = payload.tool_name ?? "Tool";
+  const input = payload.tool_input ?? {};
+  const work = session(agentId, who, agentId === CLAUDE_ID ? "Claude Code" : "Agent");
+  const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : "");
+  const path = str("file_path") || str("path") || str("notebook_path");
+  const target = path ? lastPathComponent(path) : (str("command") || str("pattern") || str("query") || str("url")).slice(0, 60);
+  // Claude Code sends no id with PreToolUse; the next PostToolUse closes the oldest open step.
+  addStep(work, ++hookStep, tool, target);
+  if (EDIT_TOOLS.has(tool) && path) {
+    void Bridge.changePreview(tool, input).then((preview) => {
+      if (!preview || State.work !== work) return;
+      setPanel(work, { file: lastPathComponent(path), path, preview });
+      if (State.focusId === agentId) showWork(island);
+      State.notify();
+    });
+  } else if (tool === "Bash" || tool === "PowerShell") {
+    setPanel(work, { file: "Terminal", path: work.who, preview: plain([`$ ${str("command")}`]) });
+  }
+}
+
+/** A tool call finished: its step, and what a command printed. */
+function workDone(agentId: string, payload: HookPayload, failed: boolean) {
+  const work = State.work;
+  if (!work || work.owner !== agentId) return;
+  const open = work.steps.find((s) => s.state === "running" && s.tool === (payload.tool_name ?? s.tool));
+  if (open) setStep(work, open.id, failed ? "failed" : "done");
+  work.at = performance.now();
+  const panel = work.panel;
+  if (!panel) return;
+  if (EDIT_TOOLS.has(payload.tool_name ?? "") && panel.preview.kind === "text") {
+    panel.outcome = failed ? "declined" : "applied";
+  }
+}
 
 const CLAUDE_ID = "integration_claude";
 
@@ -61,26 +102,27 @@ function lastPathComponent(p: string): string {
   return idx >= 0 ? cleaned.slice(idx + 1) : cleaned;
 }
 
-/** frenchStep() — same labels as the macOS app. */
+/** The step labels, in English like the rest of this build (macOS says them in French). */
 const TOOL_LABELS: Record<string, string> = {
-  Bash: "Exécute",
-  Read: "Lit",
-  Write: "Écrit",
-  Edit: "Modifie",
-  Glob: "Cherche",
-  Grep: "Recherche",
-  WebSearch: "Recherche web",
-  WebFetch: "Récupère",
-  TodoWrite: "Tâches",
+  Bash: "Run",
+  Read: "Read",
+  Write: "Write",
+  Edit: "Edit",
+  Glob: "Find",
+  Grep: "Search",
+  WebSearch: "Search web",
+  WebFetch: "Fetch",
+  TodoWrite: "Tasks",
   Task: "Agent",
-  LS: "Liste",
-  MultiEdit: "Modifie",
+  LS: "List",
+  MultiEdit: "Edit",
   NotebookEdit: "Notebook",
-  PowerShell: "Exécute",
+  PowerShell: "Run",
 };
 
 function stepLabel(tool: string, input: Record<string, unknown>): string {
-  const label = TOOL_LABELS[tool] ?? tool;
+  // MCP tools arrive as mcp__server__tool: the tool's own name says enough.
+  const label = TOOL_LABELS[tool] ?? (tool.startsWith("mcp__") ? (tool.split("__").pop() ?? tool) : tool);
   const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : null);
   const cmd = str("command");
   if (cmd) return `${label} · ${cmd.slice(0, 40)}`;
@@ -205,17 +247,20 @@ function handleHook(island: Island, payload: HookPayload) {
       State.updateTask(agentId, "working");
       const tool = payload.tool_name ?? "Tool";
       State.appendStep(agentId, stepLabel(tool, payload.tool_input ?? {}));
+      workStep(island, agentId, isExternalAgent ? validAgent! : projectName, payload);
       surface("overview", false);
       break;
     }
 
     case "PostToolUse":
       State.updateTask(agentId, "working");
+      workDone(agentId, payload, false);
       break;
 
     case "PostToolUseFailure":
       State.updateTask(agentId, "working");
       State.appendStep(agentId, "⚠ failed");
+      workDone(agentId, payload, true);
       break;
 
     case "Notification": {
@@ -232,6 +277,7 @@ function handleHook(island: Island, payload: HookPayload) {
     }
 
     case "Stop":
+      if (State.work?.owner === agentId) State.work.active = false;
       State.updateTask(agentId, "finished");
       if (payload.message) State.appendStep(agentId, payload.message.slice(0, 60));
       Sound.play("finish");
@@ -304,8 +350,17 @@ function handleHook(island: Island, payload: HookPayload) {
       State.updateTask(CLAUDE_ID, "approval");
       State.isPinned = true;
       Sound.play("approval");
+      // An edit whose diff is already in the work view is approved right there.
+      const work = State.work;
+      const path = typeof input.file_path === "string" ? input.file_path : "";
+      const inWork = EDIT_TOOLS.has(tool) && work?.owner === CLAUDE_ID && work.panel?.path === path && !!path;
+      if (inWork && work?.panel) {
+        work.panel.hookRequestId = requestId;
+        work.panel.note = `Claude Code wants to ${tool === "Write" ? "write" : "edit"} this file`;
+        work.active = true;
+      }
       if (focused) {
-        island.alert("approval");
+        island.alert(inWork ? "work" : "approval");
       } else {
         // Another agent holds the view, so the card would yank it away. The badge
         // is the signal instead — but it has to be on screen for that to mean
@@ -323,6 +378,7 @@ function handleHook(island: Island, payload: HookPayload) {
         island.dropPin();
         State.updateTask(CLAUDE_ID, "working");
         State.setPillBadge(CLAUDE_ID, null);
+        if (State.work?.panel?.hookRequestId) State.work.panel.hookRequestId = undefined;
         if (State.view === "approval") island.setView(State.defaultView());
         State.notify();
       }, 110_000);

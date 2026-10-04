@@ -32,9 +32,13 @@ const DECISION_BUDGET: Duration = Duration::from_secs(110);
 /// Fields that are pointless to forward and can be enormous (a whole file read,
 /// a full command output). The island never shows them.
 const DROPPED_FIELDS: &[&str] = &["tool_response", "transcript_path"];
-/// Longest string forwarded for any single field; the island truncates to far
-/// less than this anyway.
-const MAX_FIELD_LEN: usize = 2_000;
+/// Longest string forwarded for any single field: enough for the island to
+/// show an Edit or Write as a diff of the whole change.
+const MAX_FIELD_LEN: usize = 200_000;
+/// The island reads at most 1 MiB per message; a payload still bigger than
+/// this falls back to short fields.
+const MAX_LINE_LEN: usize = 900_000;
+const SHORT_FIELD_LEN: usize = 2_000;
 
 #[cfg(windows)]
 mod win;
@@ -236,7 +240,12 @@ fn read_event() -> Option<(String, String)> {
         }
     }
 
-    truncate_strings(&mut payload);
+    let mut short = payload.clone();
+    truncate_strings(&mut payload, MAX_FIELD_LEN);
+    if payload.to_string().len() > MAX_LINE_LEN {
+        truncate_strings(&mut short, SHORT_FIELD_LEN);
+        payload = short;
+    }
 
     let mut line = payload.to_string();
     line.push('\n');
@@ -244,12 +253,12 @@ fn read_event() -> Option<(String, String)> {
 }
 
 /// Caps every string in the payload. A single Write can carry a whole file.
-fn truncate_strings(value: &mut serde_json::Value) {
+fn truncate_strings(value: &mut serde_json::Value, max: usize) {
     match value {
         serde_json::Value::String(s) => {
-            if s.len() > MAX_FIELD_LEN {
+            if s.len() > max {
                 // Cut on a char boundary; a lone byte index can split UTF-8.
-                let mut end = MAX_FIELD_LEN;
+                let mut end = max;
                 while end > 0 && !s.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -257,8 +266,8 @@ fn truncate_strings(value: &mut serde_json::Value) {
                 s.push('…');
             }
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(truncate_strings),
-        serde_json::Value::Object(map) => map.values_mut().for_each(truncate_strings),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| truncate_strings(v, max)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| truncate_strings(v, max)),
         _ => {}
     }
 }
@@ -323,9 +332,19 @@ mod tests {
     #[test]
     fn long_strings_are_cut_on_a_char_boundary() {
         let mut v = serde_json::json!({ "tool_input": { "content": "é".repeat(4000) } });
-        truncate_strings(&mut v);
+        truncate_strings(&mut v, SHORT_FIELD_LEN);
         let s = v["tool_input"]["content"].as_str().unwrap();
-        assert!(s.len() <= MAX_FIELD_LEN + 4);
+        assert!(s.len() <= SHORT_FIELD_LEN + 4);
         assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn an_edit_is_forwarded_whole_unless_the_message_gets_too_big() {
+        let mut v = serde_json::json!({ "tool_input": { "content": "a".repeat(50_000) } });
+        truncate_strings(&mut v, MAX_FIELD_LEN);
+        assert_eq!(v["tool_input"]["content"].as_str().unwrap().len(), 50_000);
+        let mut huge = serde_json::json!({ "tool_input": { "content": "a".repeat(300_000) } });
+        truncate_strings(&mut huge, MAX_FIELD_LEN);
+        assert!(huge["tool_input"]["content"].as_str().unwrap().ends_with('…'));
     }
 }

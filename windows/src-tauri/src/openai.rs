@@ -5,13 +5,13 @@
 use serde_json::{json, Value};
 
 use crate::ai::{self, Answer, Attachment, ModelInfo, UserTurn};
-use crate::secrets;
+use crate::{agent, secrets};
 
 const ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MODELS_ENDPOINT: &str = "https://api.openai.com/v1/models";
 
 fn key() -> Result<String, String> {
-    secrets::get("openai-api-key").ok_or_else(|| "OpenAI API key missing. Open settings.".into())
+    secrets::get_current("openai-api-key").ok_or_else(|| "OpenAI API key missing. Open settings.".into())
 }
 
 pub fn user_message(turn: &UserTurn) -> Value {
@@ -63,6 +63,68 @@ pub async fn complete(model: &str, history: &[Value]) -> Result<Answer, String> 
     }
     .map_err(|e| e.describe("OpenAI API"))?;
     parse(&response)
+}
+
+/// One request of a chat turn with tools: the answer, or the tools to run.
+pub async fn step(model: &str, system: &str, messages: &[Value], definitions: &Value) -> Result<agent::Turn, String> {
+    let key = key()?;
+    let mut tools: Vec<Value> = agent::functions(definitions)
+        .into_iter()
+        .map(|(name, description, schema)| {
+            json!({ "type": "function", "name": name, "description": description, "parameters": schema })
+        })
+        .collect();
+    tools.push(json!({ "type": "web_search" }));
+    let mut body = json!({
+        "model": ai::require_model(model)?,
+        "instructions": system,
+        "input": messages,
+        "tools": tools,
+        "store": false,
+    });
+    let response = match post(&key, &body).await {
+        // Not every model can search the web: keep the functions, drop the search.
+        Err(err) if err.is_tool_refusal() => {
+            if let Some(list) = body["tools"].as_array_mut() {
+                list.retain(|t| t.get("type").and_then(Value::as_str) == Some("function"));
+            }
+            post(&key, &body).await
+        }
+        other => other,
+    }
+    .map_err(|e| e.describe("OpenAI API"))?;
+    read_step(&response)
+}
+
+fn read_step(response: &Value) -> Result<agent::Turn, String> {
+    let items = response.get("output").and_then(Value::as_array).cloned().unwrap_or_default();
+    let calls: Vec<agent::Call> = items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .map(|item| agent::Call {
+            id: item.get("call_id").and_then(Value::as_str).unwrap_or("").to_string(),
+            name: item.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+            args: agent::arguments(item.get("arguments")),
+        })
+        .collect();
+    if calls.is_empty() {
+        return parse(response).map(agent::Turn::Answer);
+    }
+    // Nothing is stored on OpenAI's side, so the calls go back as plain items:
+    // without their ids, which would point at reasoning items that were not kept.
+    let assistant = calls
+        .iter()
+        .map(|c| json!({ "type": "function_call", "call_id": c.id, "name": c.name, "arguments": c.args.to_string() }))
+        .collect();
+    Ok(agent::Turn::Calls { assistant, calls })
+}
+
+pub fn tool_results(calls: &[agent::Call], outputs: &[String]) -> Vec<Value> {
+    calls
+        .iter()
+        .zip(outputs)
+        .map(|(call, output)| json!({ "type": "function_call_output", "call_id": call.id, "output": output }))
+        .collect()
 }
 
 async fn post(key: &str, body: &Value) -> Result<Value, ai::ApiError> {
