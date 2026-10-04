@@ -94,6 +94,13 @@ export const Bridge = {
     call<Preview | null>("change_preview", { tool, input }),
   /** Allow / Deny a file change the chat model asked for. */
   toolDecision: (id: number, allow: boolean) => call<void>("tool_decision", { id, allow }),
+  /** Saves an image pasted into the chat in the inbox; its bytes go as they are. */
+  ingestPasted: async (bytes: Uint8Array, type: string): Promise<DroppedFile> => {
+    if (!IS_TAURI) throw new Error("Pasting needs the app");
+    return invoke<DroppedFile>("ingest_pasted", bytes, { headers: { "x-type": type } });
+  },
+  /** The clipboard's image, read by the app when the web view does not pass it on. */
+  pasteClipboardImage: () => callOrThrow<DroppedFile>("paste_clipboard_image"),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
   /** Only ever tells you whether a key exists — never its value. */

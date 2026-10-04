@@ -68,6 +68,72 @@ pub fn ingest(source: &str) -> Result<DroppedFile, String> {
     })
 }
 
+/// Largest pasted image taken: a full-screen screenshot is a few MB.
+const MAX_PASTE: usize = 25 * 1024 * 1024;
+
+/// An image pasted into the chat, saved in the inbox like a dropped file.
+pub fn ingest_bytes(kind: &str, bytes: &[u8]) -> Result<DroppedFile, String> {
+    if bytes.is_empty() {
+        return Err("The clipboard image is empty.".into());
+    }
+    if bytes.len() > MAX_PASTE {
+        return Err("That image is too big to paste (over 25 MB).".into());
+    }
+    let ext = match kind.trim().to_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        other => return Err(format!("{other} can't be pasted as an image.")),
+    };
+    let dir = inbox_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let (y, mo, d, h, mi, s) = crate::clock::local_now();
+    let stem = format!("Pasted image {y:04}-{mo:02}-{d:02} {h:02}.{mi:02}.{s:02}");
+    let mut dest = dir.join(format!("{stem}.{ext}"));
+    for i in 2..1000 {
+        if !dest.exists() {
+            break;
+        }
+        dest = dir.join(format!("{stem} ({i}).{ext}"));
+    }
+    std::fs::write(&dest, bytes).map_err(|e| format!("cannot save the image: {e}"))?;
+    sweep(&dir);
+    Ok(DroppedFile {
+        name: dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        path: dest.to_string_lossy().to_string(),
+        size: bytes.len() as u64,
+    })
+}
+
+/// The image on the system clipboard, for when the web view does not hand it
+/// over itself: wl-paste on Wayland.
+#[cfg(target_os = "linux")]
+pub fn clipboard_image() -> Result<DroppedFile, String> {
+    let run = |args: &[&str]| -> Result<Vec<u8>, String> {
+        let mut cmd = std::process::Command::new("wl-paste");
+        cmd.args(args);
+        crate::linux::clean_env(&mut cmd);
+        let out = cmd.output().map_err(|_| "Pasting images needs wl-paste (wl-clipboard).".to_string())?;
+        if !out.status.success() {
+            return Err("There is no image on the clipboard.".into());
+        }
+        Ok(out.stdout)
+    };
+    let types = String::from_utf8_lossy(&run(&["--list-types"])?).to_string();
+    let kind = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp"]
+        .into_iter()
+        .find(|t| types.lines().any(|l| l.trim() == *t))
+        .ok_or_else(|| "There is no image on the clipboard.".to_string())?;
+    ingest_bytes(kind, &run(&["--no-newline", "--type", kind])?)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn clipboard_image() -> Result<DroppedFile, String> {
+    Err("Paste the image straight into the chat box.".into())
+}
+
 /// Drops anything copied here more than a week ago. `ingest` stamps every copy
 /// with the time it landed, so this really is the age of the copy and not the
 /// age of whatever the user happened to drag in.
@@ -86,6 +152,19 @@ fn sweep(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_images_are_saved_with_their_type_and_unknown_types_refused() {
+        let png = ingest_bytes("image/png", b"\x89PNG fake").unwrap();
+        assert!(png.name.starts_with("Pasted image ") && png.name.ends_with(".png"), "{}", png.name);
+        assert_eq!(std::fs::read(&png.path).unwrap(), b"\x89PNG fake");
+        let again = ingest_bytes("image/png", b"second").unwrap();
+        assert_ne!(png.path, again.path, "a second paste in the same second must not overwrite the first");
+        assert!(ingest_bytes("text/html", b"<b>x</b>").is_err());
+        assert!(ingest_bytes("image/png", b"").is_err());
+        let _ = std::fs::remove_file(&png.path);
+        let _ = std::fs::remove_file(&again.path);
+    }
 
     #[test]
     fn ingest_copies_and_never_overwrites() {

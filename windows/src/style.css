@@ -776,6 +776,26 @@ input[type="range"]::-webkit-slider-thumb {
   transform: scale(1);
 }
 
+.chip-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  object-fit: cover;
+  margin: -2px 0 -2px -4px;
+}
+
+.chip-x {
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  margin-right: -4px;
+  cursor: default;
+}
+
 .chip-dot {
   width: 7px;
   height: 7px;

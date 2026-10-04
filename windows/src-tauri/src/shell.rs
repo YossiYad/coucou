@@ -251,6 +251,25 @@ step does. This computer runs {name}. Commands get no keyboard input, so use non
 never use sudo: when administrator rights are needed, use pkexec, which asks the user for their password in a system \
 window. Read the output and tell the user plainly whether it worked."
     );
+    let installed = |program: &str| {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+            .unwrap_or(false)
+            || std::env::var_os("HOME").is_some_and(|home| std::path::Path::new(&home).join(".local/bin").join(program).is_file())
+    };
+    if installed("git") {
+        note.push_str(
+            " git is installed with the user's own login: use it to clone, pull, commit and push (run git -C <folder> ... \
+for a repository, check git status first, and write short clear commit messages).",
+        );
+    }
+    if installed("gh") {
+        note.push_str(
+            " The GitHub CLI gh is installed too: use it for GitHub itself, like creating repositories, pull requests, \
+issues and releases (gh repo create, gh pr create --fill, gh repo clone); if it says it is not logged in, tell the user \
+to run gh auth login once.",
+        );
+    }
     if atomic {
         note.push_str(
             " It is an image-based (atomic) Fedora system: apps are Flatpaks (flatpak update -y updates them all, \

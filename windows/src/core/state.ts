@@ -253,7 +253,7 @@ class AppState {
 
   promptContext: PromptContext | null = null;
   /** `path` is the inbox copy; `original` where it was dropped from. */
-  droppedFile: { name: string; path: string; original?: string } | null = null;
+  droppedFile: { name: string; path: string; original?: string; sent?: boolean; preview?: string } | null = null;
   noteMessage: string | null = null;
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];

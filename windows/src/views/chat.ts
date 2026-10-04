@@ -37,11 +37,30 @@ function typingDots(activity: string | null): HTMLElement {
   );
 }
 
-/** The coloured chip showing what the question is about (a dropped file). */
-function contextChip(label: string): HTMLElement {
-  const chip = h("div", { class: "chip" }, h("i", { class: "chip-dot" }), h("span", { text: label }));
+/** The coloured chip showing what the question is about (a dropped or
+ *  pasted file), with the image itself when it is one, and an × until sent. */
+function contextChip(label: string, preview: string | undefined, onRemove: (() => void) | null): HTMLElement {
+  const chip = h(
+    "div",
+    { class: "chip" },
+    preview ? h("img", { class: "chip-thumb", src: preview, alt: "" }) : h("i", { class: "chip-dot" }),
+    h("span", { text: label }),
+    onRemove ? h("button", { class: "chip-x", title: "Remove", onclick: onRemove }, svg(ICONS.xmark, 8)) : null,
+  );
   requestAnimationFrame(() => chip.classList.add("settled"));
   return chip;
+}
+
+/** A file:// link from a file manager's copy, as a path. */
+function pastedPath(data: DataTransfer): string | null {
+  const text = (data.getData("text/uri-list") || data.getData("text/plain") || "").trim();
+  const first = text.split(/\r?\n/).find((l) => l && !l.startsWith("#")) ?? "";
+  if (!first.startsWith("file://")) return null;
+  try {
+    return decodeURIComponent(new URL(first).pathname);
+  } catch {
+    return null;
+  }
 }
 
 /** Sets the permission mode and keeps it, like Claude Code's Shift+Tab. */
@@ -143,11 +162,11 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
     State.notify();
     onHeightChange();
 
+    // A file goes with the first question after it was dropped or pasted.
     const file = State.droppedFile;
     const context: ChatContext | null =
-      State.chatHistory.length === 1 && file
-        ? { kind: "file", name: file.name, path: file.path, original: file.original }
-        : null;
+      file && !file.sent ? { kind: "file", name: file.name, path: file.path, original: file.original } : null;
+    if (file) file.sent = true;
 
     // The conversation may be cleared while the answer is on its way (the
     // island hid): it then belongs to nothing on screen.
@@ -186,6 +205,48 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
   }
 
   send.addEventListener("click", () => void submit());
+  // Ctrl+V of a screenshot, a copied image or a file copied in the file
+  // manager attaches it to the next question; plain text pastes as text.
+  const attach = (file: { name: string; path: string }, preview?: string) => {
+    const old = State.droppedFile?.preview;
+    if (old && old !== preview) URL.revokeObjectURL(old);
+    State.droppedFile = { name: file.name, path: file.path, original: file.path, sent: false, preview };
+    Sound.play("blip");
+    State.notify();
+    onHeightChange();
+  };
+  const pasteFailed = (err: unknown) => {
+    State.noteMessage = String(err).replace(/^Error:\s*/, "");
+    actions.setView("note");
+  };
+  input.addEventListener("paste", (e) => {
+    const data = (e as ClipboardEvent).clipboardData;
+    if (!data) return;
+    const image = Array.from(data.items).find((i) => i.kind === "file" && i.type.startsWith("image/"));
+    const blob = image?.getAsFile();
+    if (blob) {
+      e.preventDefault();
+      void blob
+        .arrayBuffer()
+        .then((buf) => Bridge.ingestPasted(new Uint8Array(buf), blob.type))
+        .then((file) => attach(file, URL.createObjectURL(blob)))
+        .catch(pasteFailed);
+      return;
+    }
+    const path = pastedPath(data);
+    if (path) {
+      e.preventDefault();
+      void Bridge.ingestFile(path).then((file) => attach(file)).catch(pasteFailed);
+      return;
+    }
+    if (!data.getData("text/plain")) {
+      // Nothing the web view understood, but the clipboard may still hold an
+      // image (WebKitGTK does not pass every one on): ask the app for it.
+      e.preventDefault();
+      void Bridge.pasteClipboardImage().then((file) => attach(file)).catch(pasteFailed);
+    }
+  });
+
   input.addEventListener("keydown", (e) => {
     const key = e as KeyboardEvent;
     if (key.key === "Enter") {
@@ -215,11 +276,20 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
     el,
     sync() {
       const file = State.droppedFile;
-      const wantChip = file?.name ?? "";
+      const wantChip = file ? `${file.name}|${file.sent ? 1 : 0}` : "";
       if (chipRow.dataset.label !== wantChip) {
         chipRow.dataset.label = wantChip;
         clear(chipRow);
-        if (wantChip) chipRow.append(contextChip(wantChip));
+        if (file) {
+          const remove = file.sent
+            ? null
+            : () => {
+                if (file.preview) URL.revokeObjectURL(file.preview);
+                State.droppedFile = null;
+                State.notify();
+              };
+          chipRow.append(contextChip(file.name, file.preview, remove));
+        }
       }
 
       const thinking = State.stateOverride === "thinking";

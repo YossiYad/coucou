@@ -220,7 +220,14 @@ pub async fn send<R: tauri::Runtime>(
     };
     let text = format!("{query}\n\n{hint}");
     let acts = settings.tools_enabled;
-    let turn = UserTurn::new(text, if chat.is_empty() { context } else { None }, acts);
+    // A file (dropped or pasted) rides along whenever the island sends one;
+    // the window the user was in only opens a conversation.
+    let context = match context {
+        Some(file @ ChatContext::File { .. }) => Some(file),
+        other if chat.is_empty() => other,
+        _ => None,
+    };
+    let turn = UserTurn::new(text, context, acts);
 
     // What was asked of whom, never the words themselves.
     let file = turn.file.as_ref().map(|f| format!(", file {}", f.name)).unwrap_or_default();
@@ -242,11 +249,24 @@ pub async fn send<R: tauri::Runtime>(
     if let Err(err) = &result {
         if settings.ai_fallback && fallback::worth_another(err) {
             let first_error = err.clone();
-            let turns = fallback::transcript(&history);
+            // Earlier turns go across as text; this question keeps its file or
+            // image, shaped for the model that takes it.
+            let earlier = fallback::transcript(&history[..history.len().saturating_sub(1)]);
             for target in fallback::candidates(settings, &chosen, &fallback::accounts) {
+                let question = match target.provider {
+                    Provider::Anthropic => claude::user_message(&turn),
+                    Provider::OpenAi => openai::user_message(&turn),
+                    Provider::Gemini => gemini::user_message(&turn),
+                    Provider::Local => match local_llm::user_message(&turn) {
+                        Ok(message) => message,
+                        Err(_) => continue, // a scanned PDF the local model cannot read
+                    },
+                };
+                let mut asked = fallback::rebuild(target.provider, &earlier);
+                asked.push(question);
                 crate::log::line(format!("chat: {} could not answer, asking {}", chosen.name(), target.name()));
                 let _ = tauri::Emitter::emit_to(app, crate::island::WINDOW_LABEL, "ai-fallback", serde_json::json!({ "name": target.name() }));
-                match ask(app, &target, settings, &fallback::rebuild(target.provider, &turns), acts).await {
+                match ask(app, &target, settings, &asked, acts).await {
                     Ok(answer) => {
                         note = Some(format!("{} answered because {} {}.", target.name(), chosen.name(), fallback::reason(&first_error)));
                         // Kept in the chosen provider's format, so the conversation carries on there.
