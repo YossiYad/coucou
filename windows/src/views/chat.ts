@@ -11,12 +11,75 @@ import type { ViewActions, ViewHost } from "./views";
 
 let nextId = 1;
 
+/** Shows an image large over the chat; Esc, a click outside or × closes it. */
+function buildLightbox() {
+  const img = h("img", { class: "lightbox-img", alt: "" }) as HTMLImageElement;
+  const full = h("button", { class: "lightbox-btn", text: "Open full size" });
+  const close = h("button", { class: "lightbox-x", title: "Close" }, svg(ICONS.xmark, 10));
+  const el = h("div", { class: "lightbox" }, img, h("div", { class: "lightbox-bar" }, full, close));
+  let path: string | undefined;
+  /** Set by the chat view: the island resizes when the picture opens or closes. */
+  let resized = () => {};
+  const hide = () => {
+    el.classList.remove("open");
+    State.imageOpen = false;
+    resized();
+  };
+  el.addEventListener("click", (e) => {
+    if (e.target === el) hide();
+  });
+  close.addEventListener("click", hide);
+  // Esc closes the picture first, before it could close the whole island.
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.key !== "Escape" || !el.classList.contains("open")) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      hide();
+    },
+    true,
+  );
+  full.addEventListener("click", () => {
+    if (path) void Bridge.openInboxFile(path).catch(() => {});
+  });
+  return {
+    el,
+    show(src: string, file?: string) {
+      img.src = src;
+      path = file;
+      full.style.display = file ? "" : "none";
+      el.classList.add("open");
+      State.imageOpen = true;
+      resized();
+    },
+    onResize(fn: () => void) {
+      resized = fn;
+    },
+  };
+}
+
+const lightbox = buildLightbox();
+
 function bubble(message: ChatMessage): HTMLElement {
   if (message.role === "user") {
     return h(
       "div",
       { class: "chat-row user" },
-      h("div", { class: "bubble", dir: "auto", text: message.content }),
+      h(
+        "div",
+        { class: "user-turn" },
+        message.image
+          ? h("img", {
+              class: "bubble-img",
+              src: message.image,
+              alt: "",
+              title: "Click to enlarge",
+              onclick: () => lightbox.show(message.image!, message.imagePath),
+            })
+          : null,
+        h("div", { class: "bubble", dir: "auto", text: message.content }),
+      ),
     );
   }
   // dir="auto": Hebrew or Arabic reads right to left, punctuation included.
@@ -39,11 +102,24 @@ function typingDots(activity: string | null): HTMLElement {
 
 /** The coloured chip showing what the question is about (a dropped or
  *  pasted file), with the image itself when it is one, and an × until sent. */
-function contextChip(label: string, preview: string | undefined, onRemove: (() => void) | null): HTMLElement {
+function contextChip(
+  label: string,
+  preview: string | undefined,
+  path: string,
+  onRemove: (() => void) | null,
+): HTMLElement {
   const chip = h(
     "div",
     { class: "chip" },
-    preview ? h("img", { class: "chip-thumb", src: preview, alt: "" }) : h("i", { class: "chip-dot" }),
+    preview
+      ? h("img", {
+          class: "chip-thumb",
+          src: preview,
+          alt: "",
+          title: "Click to enlarge",
+          onclick: () => lightbox.show(preview, path),
+        })
+      : h("i", { class: "chip-dot" }),
     h("span", { text: label }),
     onRemove ? h("button", { class: "chip-x", title: "Remove", onclick: onRemove }, svg(ICONS.xmark, 8)) : null,
   );
@@ -62,6 +138,12 @@ function pastedPath(data: DataTransfer): string | null {
     return null;
   }
 }
+
+/** A microphone, for talking to it. */
+const MIC_ICON = "M12 3.5a2.6 2.6 0 0 0-2.6 2.6v5.4a2.6 2.6 0 0 0 5.2 0V6.1A2.6 2.6 0 0 0 12 3.5z M6.5 11a5.5 5.5 0 0 0 11 0 M12 16.5v4";
+
+/** A monitor outline, for the screen sharing button. */
+const SCREEN_ICON = "M3 4.5h18v11.5H3z M9 20.5h6 M12 16v4.5";
 
 /** Sets the permission mode and keeps it, like Claude Code's Shift+Tab. */
 function setMode(mode: PermissionMode) {
@@ -123,8 +205,69 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
   }) as HTMLInputElement;
   const send = h("button", { class: "send-btn", title: "Send" }, svg(ICONS.arrowUp, 11));
   const picker = buildModePicker();
+  lightbox.onResize(onHeightChange);
   const stepsBtn = h("button", { class: "steps-btn", title: "What it did", onclick: () => actions.setView("work") }, svg(ICONS.stack, 12));
-  const bar = h("div", { class: "chat-bar" }, picker.button, input, stepsBtn, send);
+  // Screen sharing: while on, every question takes a screenshot along.
+  const screenBtn = h("button", { class: "screen-btn", title: "Share your screen with each question" }, svg(SCREEN_ICON, 13, { stroke: 1.8 }));
+  screenBtn.addEventListener("mousedown", (e) => e.preventDefault());
+  screenBtn.addEventListener("click", () => {
+    State.settings.screenSharing = !State.settings.screenSharing;
+    void Bridge.saveSettings(State.settings);
+    Sound.play("blip");
+    State.notify();
+  });
+  // Talking: click to listen, click again to send what was said.
+  const micBtn = h("button", { class: "mic-btn", title: "Talk to it" }, svg(MIC_ICON, 13, { stroke: 1.8 }));
+  let listening = false;
+  let spokenTurn = false;
+  const stopListening = async (send: boolean) => {
+    listening = false;
+    updateEngaged();
+    micBtn.classList.remove("on", "busy");
+    input.placeholder = State.chatHistory.length === 0 ? "Ask me anything…" : "Continue…";
+    if (!send) {
+      void Bridge.voiceCancel();
+      updateEngaged();
+      return;
+    }
+    micBtn.classList.add("busy");
+    try {
+      const said = await Bridge.voiceStop();
+      input.value = said;
+      spokenTurn = true;
+      void submit();
+    } catch (err) {
+      State.noteMessage = String(err).replace(/^Error:\s*/, "");
+      actions.setView("note");
+    } finally {
+      micBtn.classList.remove("busy");
+    }
+  };
+  micBtn.addEventListener("mousedown", (e) => e.preventDefault());
+  micBtn.addEventListener("click", async () => {
+    if (listening) return void stopListening(true);
+    void Bridge.stopSpeaking();
+    try {
+      await Bridge.voiceStart();
+      listening = true;
+      updateEngaged();
+      micBtn.classList.add("on");
+      input.placeholder = "Listening… click the microphone when you're done";
+      Sound.play("blip");
+    } catch (err) {
+      State.noteMessage = String(err).replace(/^Error:\s*/, "");
+      actions.setView("note");
+    }
+  });
+  const bar = h("div", { class: "chat-bar" }, picker.button, input, micBtn, stepsBtn, send);
+  // Screen sharing sits outside the box, on its left: a switch, not a tool.
+  const barRow = h("div", { class: "chat-bar-row" }, screenBtn, bar);
+  /** Live guidance: "I did that", with a fresh look at the screen. */
+  const nextStep = h("button", { class: "go-ahead next-step" }, h("span", { text: "Done, next step" }));
+  nextStep.addEventListener("click", () => {
+    input.value = "I did that. What's the next step?";
+    void submit();
+  });
   /** After a plan: run it in the mode used before Plan. */
   const goAhead = h("button", { class: "go-ahead" }, h("span", { text: "Go ahead" }));
   goAhead.addEventListener("click", () => {
@@ -136,7 +279,7 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
   const el = h(
     "div",
     { class: "view" },
-    h("div", { class: "card wash chat-card" }, h("div", { class: "chat-body" }, chipRow, log, bar), picker.menu),
+    h("div", { class: "card wash chat-card" }, h("div", { class: "chat-body" }, chipRow, log, barRow), picker.menu, lightbox.el),
   );
   (el.querySelector(".card") as HTMLElement).style.setProperty("--wash", "rgba(99,102,241,0.5)");
 
@@ -144,10 +287,20 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
   let renderedKey = "";
 
   /** Typing, a half-written question, or an answer on its way: keep the island open. */
+  /** What really holds the island open: a question being written, waited for
+   *  or spoken. Focus in an empty box only buys the usual close delay, or one
+   *  answer left the island open for good (the box takes focus after it). */
   function updateEngaged() {
-    State.chatEngaged = sending || input.value.trim() !== "" || document.activeElement === input;
+    State.chatEngaged = sending || listening || input.value.trim() !== "";
   }
-  for (const event of ["input", "focus", "blur"]) input.addEventListener(event, updateEngaged);
+  const touched = () => {
+    updateEngaged();
+    const grace = performance.now() + State.settings.autoCloseInterval * 1000;
+    State.chatReadUntil = Math.max(State.chatReadUntil, grace);
+  };
+  input.addEventListener("input", touched);
+  input.addEventListener("focus", touched);
+  input.addEventListener("blur", updateEngaged);
 
   async function submit() {
     const query = input.value.trim();
@@ -157,7 +310,25 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
     updateEngaged();
     Sound.play("send");
 
-    State.chatHistory.push({ id: nextId++, role: "user", content: query });
+    // Sharing the screen: the question goes with what is on it now, unless
+    // the user attached something of their own.
+    if (State.settings.screenSharing && !(State.droppedFile && !State.droppedFile.sent)) {
+      try {
+        const shot = await Bridge.captureScreen(State.settings.screenScope === "all");
+        State.droppedFile = { name: shot.name, path: shot.path, original: shot.path, sent: false, preview: shot.preview };
+      } catch (err) {
+        State.noteMessage = String(err).replace(/^Error:\s*/, "");
+      }
+    }
+
+    const unsent = State.droppedFile && !State.droppedFile.sent ? State.droppedFile : null;
+    State.chatHistory.push({
+      id: nextId++,
+      role: "user",
+      content: query,
+      image: unsent?.preview,
+      imagePath: unsent?.preview ? unsent.path : undefined,
+    });
     State.stateOverride = "thinking";
     State.notify();
     onHeightChange();
@@ -181,6 +352,8 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
       if (State.view === "work") actions.setView("prompt");
       if (State.chatHistory === conversation) {
         State.answeredInPlan = planning;
+        // A spoken question gets a spoken answer.
+        if (spokenTurn && State.settings.speakAnswers) void Bridge.speak(reply.text);
         // However long the wait, the answer gets a full close delay to be read.
         State.chatReadUntil = performance.now() + State.settings.autoCloseInterval * 1000;
         State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text, note: reply.note ?? undefined });
@@ -195,6 +368,7 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
         Sound.play("error");
       }
     } finally {
+      spokenTurn = false;
       State.toolActivity = null;
       sending = false;
       updateEngaged();
@@ -207,9 +381,11 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
   send.addEventListener("click", () => void submit());
   // Ctrl+V of a screenshot, a copied image or a file copied in the file
   // manager attaches it to the next question; plain text pastes as text.
-  const attach = (file: { name: string; path: string }, preview?: string) => {
-    const old = State.droppedFile?.preview;
-    if (old && old !== preview) URL.revokeObjectURL(old);
+  const attach = (file: { name: string; path: string; preview?: string }, local?: string) => {
+    // A sent image stays on screen in its message; only an unsent one is let go.
+    const old = State.droppedFile;
+    if (old && !old.sent && old.preview?.startsWith("blob:")) URL.revokeObjectURL(old.preview);
+    const preview = file.preview ?? local;
     State.droppedFile = { name: file.name, path: file.path, original: file.path, sent: false, preview };
     Sound.play("blip");
     State.notify();
@@ -253,6 +429,12 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
       e.preventDefault();
       void submit();
     }
+    if (key.key === "Escape" && listening) {
+      // Escape while listening throws the recording away.
+      e.preventDefault();
+      void stopListening(false);
+      return;
+    }
     if (key.key === "Tab" && key.shiftKey && State.settings.toolsEnabled) {
       // Shift+Tab cycles the modes, as in Claude Code.
       e.preventDefault();
@@ -284,26 +466,33 @@ export function buildPrompt(onHeightChange: () => void, actions: ViewActions): V
           const remove = file.sent
             ? null
             : () => {
-                if (file.preview) URL.revokeObjectURL(file.preview);
+                if (file.preview?.startsWith("blob:")) URL.revokeObjectURL(file.preview);
                 State.droppedFile = null;
                 State.notify();
               };
-          chipRow.append(contextChip(file.name, file.preview, remove));
+          chipRow.append(contextChip(file.name, file.preview, file.path, remove));
         }
       }
 
       const thinking = State.stateOverride === "thinking";
       const offerPlan = !thinking && State.answeredInPlan && State.chatHistory.at(-1)?.role === "assistant";
-      const key = `${State.chatHistory.length}|${thinking}|${thinking ? State.toolActivity ?? "" : ""}|${offerPlan}`;
+      const offerNext =
+        !thinking && !offerPlan && State.settings.screenSharing && State.chatHistory.at(-1)?.role === "assistant";
+      const key = `${State.chatHistory.length}|${thinking}|${thinking ? State.toolActivity ?? "" : ""}|${offerPlan}|${offerNext}`;
       if (key !== renderedKey) {
         renderedKey = key;
         clear(log);
         for (const m of State.chatHistory) log.append(bubble(m));
         if (thinking) log.append(typingDots(State.toolActivity));
         if (offerPlan) log.append(h("div", { class: "chat-row" }, goAhead));
+        if (offerNext) log.append(h("div", { class: "chat-row" }, nextStep));
         log.scrollTop = log.scrollHeight;
       }
       picker.sync();
+      screenBtn.classList.toggle("on", State.settings.screenSharing);
+      screenBtn.title = State.settings.screenSharing
+        ? "Screen sharing is on: each question takes a screenshot. Click to stop."
+        : "Share your screen with each question";
       const work = State.work;
       stepsBtn.style.display = work?.owner === "chat" && work.steps.length ? "" : "none";
 

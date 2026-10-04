@@ -24,6 +24,7 @@ const VERBS: Record<string, string> = {
   search_web: "Search web",
   open: "Open",
   run_command: "Run",
+  look_at_screen: "Look",
   // Claude Code's own tools.
   Read: "Read",
   Edit: "Edit",
@@ -79,7 +80,7 @@ function fileBadge(file: string): HTMLElement {
     py: ["PY", "#4b8bbe"], json: ["{}", "#9ca3af"], html: ["<>", "#e34c26"], css: ["CSS", "#7c5cff"],
     sh: ["$", "#9ca3af"],
   };
-  const [label, color] = file === "Terminal" ? ["$", "#4b5563"] : (kinds[ext] ?? [ext ? ext.slice(0, 3).toUpperCase() : "•", "#6b7280"]);
+  const [label, color] = file === "Screen" ? ["▣", "#6366f1"] : file === "Terminal" ? ["$", "#4b5563"] : (kinds[ext] ?? [ext ? ext.slice(0, 3).toUpperCase() : "•", "#6b7280"]);
   const badge = h("span", { class: "file-badge", text: label });
   badge.style.background = color;
   return badge;
@@ -157,6 +158,8 @@ function renderPreview(preview: Preview): HTMLElement {
       return renderTable(preview);
     case "doc":
       return renderDoc(preview);
+    case "image":
+      return h("div", { class: "shot-wrap" }, h("img", { class: "shot", src: preview.src, alt: "" }));
   }
 }
 

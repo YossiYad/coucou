@@ -76,6 +76,26 @@ so a free key runs out fast. Another Gemini model in Settings has its own quota,
     )
 }
 
+/// What was said in a recording, word for word, in the language it was said in.
+pub async fn transcribe(model: &str, audio: &[u8]) -> Result<String, String> {
+    let key = key()?;
+    let model = model_path(model)?;
+    let body = json!({
+        "contents": [{ "role": "user", "parts": [
+            { "inline_data": { "mime_type": "audio/wav", "data": ai::base64(audio) } },
+            { "text": "Transcribe this recording exactly as it was spoken, in the language it was spoken in (often Hebrew or \
+English). Reply with the words only: no quotes, no notes, no translation. If nothing was said, reply with nothing." },
+        ]}],
+    });
+    let response = post(&key, &model, &body).await.map_err(|e| explain(&e))?;
+    let text = parse(&response)?.text;
+    let text = text.trim().trim_matches('"').trim().to_string();
+    if text.is_empty() {
+        return Err("I didn't catch any words. Try again a little closer to the microphone.".into());
+    }
+    Ok(text)
+}
+
 /// One request of a chat turn with tools: the answer, or the tools to run.
 /// No Google Search here: its quota runs out long before plain answers do,
 /// and the search_web tool covers it.
@@ -123,18 +143,22 @@ fn read_step(response: &Value) -> Result<agent::Turn, String> {
     Ok(agent::Turn::Calls { assistant: vec![turn], calls })
 }
 
-pub fn tool_results(calls: &[agent::Call], outputs: &[String]) -> Vec<Value> {
-    let parts: Vec<Value> = calls
+pub fn tool_results(calls: &[agent::Call], outputs: &[crate::tools::ToolOutput]) -> Vec<Value> {
+    let mut parts: Vec<Value> = calls
         .iter()
         .zip(outputs)
         .map(|(call, output)| {
-            let mut response = json!({ "name": call.name, "response": { "result": output } });
+            let mut response = json!({ "name": call.name, "response": { "result": output.text } });
             if !call.id.is_empty() {
                 response["id"] = json!(call.id);
             }
             json!({ "functionResponse": response })
         })
         .collect();
+    // Pictures a tool returned ride in the same turn, after the responses.
+    for picture in outputs.iter().filter_map(|o| o.image.as_ref()) {
+        parts.push(json!({ "inline_data": { "mime_type": picture.media, "data": picture.base64() } }));
+    }
     vec![json!({ "role": "user", "parts": parts })]
 }
 

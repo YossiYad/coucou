@@ -65,6 +65,23 @@ body {
 
 /* ── Island ─────────────────────────────────────────────────────────────── */
 
+[data-dock="left"] #wake-strip,
+[data-dock="right"] #wake-strip {
+  top: 50%;
+  transform: translateY(-50%);
+  width: 6px;
+  height: 240px;
+}
+
+[data-dock="left"] #wake-strip {
+  left: 0;
+}
+
+[data-dock="right"] #wake-strip {
+  left: auto;
+  right: 0;
+}
+
 #island {
   position: absolute;
   top: 0;
@@ -777,11 +794,83 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .chip-thumb {
-  width: 22px;
-  height: 22px;
-  border-radius: 5px;
+  width: 34px;
+  height: 34px;
+  border-radius: 7px;
   object-fit: cover;
-  margin: -2px 0 -2px -4px;
+  margin: -2px 0 -2px -6px;
+}
+
+.chip-thumb,
+.bubble-img {
+  cursor: zoom-in;
+}
+
+.lightbox {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 10px 44px;
+  background: rgba(8, 9, 11, 0.94);
+  border-radius: inherit;
+}
+
+.lightbox.open {
+  display: flex;
+}
+
+.lightbox-img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 10px;
+  object-fit: contain;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6);
+}
+
+.lightbox-bar {
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  display: flex;
+  gap: 6px;
+}
+
+.lightbox-btn,
+.lightbox-x {
+  border: 0;
+  border-radius: 8px;
+  height: 26px;
+  padding: 0 10px;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--ink);
+  font: 500 11.5px var(--font);
+  cursor: default;
+  display: grid;
+  place-items: center;
+}
+
+.lightbox-x {
+  width: 26px;
+  padding: 0;
+}
+
+.user-turn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  min-width: 0;
+}
+
+.bubble-img {
+  max-width: 180px;
+  max-height: 110px;
+  border-radius: 10px;
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .chip-x {
@@ -938,7 +1027,8 @@ input[type="range"]::-webkit-slider-thumb {
 .mode-menu {
   position: absolute;
   z-index: 5;
-  left: 84px;
+  /* Above the mode button, which sits right of the screen button. */
+  left: 126px;
   bottom: 56px;
   width: 440px;
   padding: 5px;
@@ -1004,6 +1094,83 @@ input[type="range"]::-webkit-slider-thumb {
   color: var(--dim-4);
   width: 10px;
   text-align: right;
+}
+
+.mic-btn {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--dim);
+  display: grid;
+  place-items: center;
+  cursor: default;
+}
+
+.mic-btn.on {
+  background: var(--red);
+  color: #fff;
+  animation: listening 1.1s ease-in-out infinite;
+}
+
+.mic-btn.busy {
+  opacity: 0.5;
+}
+
+@keyframes listening {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(244, 80, 94, 0.55); }
+  50% { box-shadow: 0 0 0 5px rgba(244, 80, 94, 0); }
+}
+
+.chat-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-bar-row .chat-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.screen-btn {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--dim);
+  display: grid;
+  place-items: center;
+  cursor: default;
+}
+
+.screen-btn.on {
+  background: rgba(99, 102, 241, 0.9);
+  color: #fff;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.35);
+}
+
+.next-step {
+  background: #a5b4fc;
+}
+
+.shot-wrap {
+  padding: 4px 10px;
+}
+
+.shot {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  /* The whole screen in view, not its top strip. */
+  max-height: 140px;
+  object-fit: contain;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .steps-btn {

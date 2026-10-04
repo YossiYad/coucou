@@ -196,7 +196,8 @@ async fn agent<R: Runtime>(
                 Some(v) => v.clone(),
                 None => json!({}),
             };
-            let result = tools::run(app, name, &args, mode).await;
+            let output = tools::run(app, name, &args, mode).await;
+            let result = output.text;
             last_failed = result.starts_with("Error:") || result.starts_with("Failed with exit code");
             let outcome = if result.starts_with("Error:") { result.as_str() } else { "ok" };
             crate::log::line(format!("tool: {name} {} -> {outcome}", crate::agent::summary(&args)));
@@ -207,6 +208,13 @@ async fn agent<R: Runtime>(
                 reply["tool_call_id"] = id.clone();
             }
             messages.push(reply);
+            if let Some(picture) = output.image {
+                // Only a vision model makes anything of it; others read the text above.
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{ "type": "image_url", "image_url": { "url": picture.data_url() } }],
+                }));
+            }
         }
     }
     Err("That took too many steps. Try asking for something narrower.".into())

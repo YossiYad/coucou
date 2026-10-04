@@ -139,12 +139,14 @@ pub struct ModelInfo {
 }
 
 /// A file's contents, read once and shaped by each provider.
+#[derive(Clone)]
 pub enum Attachment {
     Image { media: &'static str, data: Vec<u8> },
     Pdf(Vec<u8>),
     Text(String),
 }
 
+#[derive(Clone)]
 pub struct FileNote {
     pub name: String,
     /// None when the file could not be read or is too large to inline.
@@ -246,25 +248,33 @@ pub async fn send<R: tauri::Runtime>(
     let chosen = fallback::Target::new(provider, &chosen_model(provider, settings), 1);
     let mut result = ask(app, &chosen, settings, &history, acts).await;
     let mut note = None;
-    if let Err(err) = &result {
-        if settings.ai_fallback && fallback::worth_another(err) {
-            let first_error = err.clone();
+    if let Some(err) = result.as_ref().err().cloned() {
+        // A model that stopped half-way says what it had already done.
+        let (first_error, mut done) = fallback::split_progress(&err);
+        if settings.ai_fallback && fallback::worth_another(&first_error) {
             // Earlier turns go across as text; this question keeps its file or
             // image, shaped for the model that takes it.
             let earlier = fallback::transcript(&history[..history.len().saturating_sub(1)]);
             for target in fallback::candidates(settings, &chosen, &fallback::accounts) {
+                // Taking over half-way: the question comes with what was done.
+                let resumed = (!done.is_empty()).then(|| UserTurn {
+                    text: format!("{}{}", turn.text, fallback::carry_on(&done)),
+                    file: turn.file.clone(),
+                    window: turn.window.clone(),
+                });
+                let this_turn = resumed.as_ref().unwrap_or(&turn);
                 let question = match target.provider {
-                    Provider::Anthropic => claude::user_message(&turn),
-                    Provider::OpenAi => openai::user_message(&turn),
-                    Provider::Gemini => gemini::user_message(&turn),
-                    Provider::Local => match local_llm::user_message(&turn) {
+                    Provider::Anthropic => claude::user_message(this_turn),
+                    Provider::OpenAi => openai::user_message(this_turn),
+                    Provider::Gemini => gemini::user_message(this_turn),
+                    Provider::Local => match local_llm::user_message(this_turn) {
                         Ok(message) => message,
                         Err(_) => continue, // a scanned PDF the local model cannot read
                     },
                 };
                 let mut asked = fallback::rebuild(target.provider, &earlier);
                 asked.push(question);
-                crate::log::line(format!("chat: {} could not answer, asking {}", chosen.name(), target.name()));
+                crate::log::line(format!("chat: {} could not answer ({first_error}), asking {}", chosen.name(), target.name()));
                 let _ = tauri::Emitter::emit_to(app, crate::island::WINDOW_LABEL, "ai-fallback", serde_json::json!({ "name": target.name() }));
                 match ask(app, &target, settings, &asked, acts).await {
                     Ok(answer) => {
@@ -274,13 +284,25 @@ pub async fn send<R: tauri::Runtime>(
                         break;
                     }
                     Err(e) => {
-                        crate::log::line(format!("chat: {} failed too: {e}", target.name()));
-                        if !fallback::worth_another(&e) {
+                        let (message, more) = fallback::split_progress(&e);
+                        done.extend(more);
+                        crate::log::line(format!("chat: {} failed too: {message}", target.name()));
+                        if !fallback::worth_another(&message) {
                             break;
                         }
                     }
                 }
             }
+        }
+        if result.is_err() {
+            result = if done.is_empty() {
+                Err(first_error)
+            } else {
+                // Nobody could finish, but things were changed: say what, and
+                // keep it in the conversation.
+                let text = format!("I could not finish: {first_error}\n\nWhat was already done stays done:\n- {}", done.join("\n- "));
+                Ok(Answer { stored: fallback::stored_text(provider, &text), text })
+            };
         }
     }
     let secs = started.elapsed().as_secs_f32();

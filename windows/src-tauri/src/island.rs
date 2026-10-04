@@ -42,6 +42,51 @@ pub const STRIP_H: f64 = 6.0;
 
 pub const WINDOW_LABEL: &str = "island";
 
+/// The edge the island is docked to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dock {
+    Top,
+    Left,
+    Right,
+}
+
+impl Dock {
+    pub fn parse(id: &str) -> Self {
+        match id {
+            "left" => Self::Left,
+            "right" => Self::Right,
+            _ => Self::Top,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+/// The dock and the monitor it was dragged to, from the settings.
+fn placement(app: &AppHandle) -> (Dock, String) {
+    app.try_state::<crate::Shared>()
+        .map(|s| {
+            let settings = s.settings.lock().unwrap();
+            (Dock::parse(&settings.dock), settings.dock_screen.clone())
+        })
+        .unwrap_or((Dock::Top, String::new()))
+}
+
+/// The wake strip's size: along the edge the island is docked to.
+pub fn strip_size(dock: Dock) -> (f64, f64) {
+    if dock == Dock::Top {
+        (STRIP_W, STRIP_H)
+    } else {
+        (STRIP_H, STRIP_W)
+    }
+}
+
 /// Margin around the island that still counts as "on the island", in logical px.
 /// Wider than the macOS 6 pt because a click must never be swallowed.
 const HIT_MARGIN: f64 = 14.0;
@@ -200,6 +245,13 @@ fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
 /// The display the island lives on: the primary one, or the one under the cursor.
 fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
     let monitors = app.available_monitors().ok()?;
+    // Dragged to a monitor: that one, while it is connected.
+    let (_, dock_screen) = placement(app);
+    if !dock_screen.is_empty() {
+        if let Some(m) = monitors.iter().find(|m| m.name().is_some_and(|n| *n == dock_screen)) {
+            return Some(m.clone());
+        }
+    }
     if pref == "cursor" {
         if let Some((cx, cy)) = cursor_physical(app) {
             if let Some(m) = monitors.iter().find(|m| monitor_contains(m, cx, cy)) {
@@ -240,11 +292,15 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let mp = *m.position();
     let ms = *m.size();
 
-    let (lw, lh) = if collapsed { (STRIP_W, STRIP_H) } else { (PANEL_W, PANEL_H) };
+    let (dock, _) = placement(app);
+    let (lw, lh) = if collapsed { strip_size(dock) } else { (PANEL_W, PANEL_H) };
     let pw = (lw * scale).round().max(1.0) as u32;
     let ph = (lh * scale).round().max(1.0) as u32;
-    let x = mp.x + (ms.width as i32 - pw as i32) / 2;
-    let y = mp.y;
+    let (x, y) = match dock {
+        Dock::Top => (mp.x + (ms.width as i32 - pw as i32) / 2, mp.y),
+        Dock::Left => (mp.x, mp.y + (ms.height as i32 - ph as i32) / 2),
+        Dock::Right => (mp.x + ms.width as i32 - pw as i32, mp.y + (ms.height as i32 - ph as i32) / 2),
+    };
 
     // GTK never sizes a non-resizable window below its natural size (200 px
     // here), so on Linux the 6 px wake strip would stay a 200 px block. tao
@@ -487,6 +543,7 @@ pub fn update_input_region(app: &AppHandle, gate: &PollGate) {
     let Some(win) = window(app) else { return };
     let collapsed = gate.collapsed.load(Ordering::Relaxed);
     let r = gate.rect();
+    let (strip_w, strip_h) = strip_size(placement(app).0);
     let _ = app.run_on_main_thread(move || {
         use gtk::cairo::{RectangleInt, Region};
         use gtk::prelude::*;
@@ -499,7 +556,7 @@ pub fn update_input_region(app: &AppHandle, gate: &PollGate) {
             // Only the wake strip, even if the window manager kept the window
             // larger than asked: an invisible block at the top of the screen
             // swallowing clicks is the one thing this must never be.
-            Region::create_rectangle(&RectangleInt::new(0, 0, STRIP_W as i32, STRIP_H as i32))
+            Region::create_rectangle(&RectangleInt::new(0, 0, strip_w as i32, strip_h as i32))
         } else if r.w > 0.0 {
             let x = (r.x - HIT_MARGIN).max(0.0).floor() as i32;
             let y = (r.y - HIT_MARGIN).max(0.0).floor() as i32;
@@ -538,4 +595,177 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
             }
         }
     });
+}
+
+/// Where a dragged island lands: the monitor its centre is over (or the
+/// nearest), and the closest of that monitor's three docks.
+pub fn snap_target(monitors: &[(String, i32, i32, u32, u32)], cx: f64, cy: f64) -> Option<(String, Dock)> {
+    let inside = |&&(_, x, y, w, h): &&(String, i32, i32, u32, u32)| {
+        cx >= x as f64 && cx < x as f64 + w as f64 && cy >= y as f64 && cy < y as f64 + h as f64
+    };
+    let distance = |&(_, x, y, w, h): &(String, i32, i32, u32, u32)| {
+        let dx = (cx - (x as f64 + w as f64 / 2.0)).abs() - w as f64 / 2.0;
+        let dy = (cy - (y as f64 + h as f64 / 2.0)).abs() - h as f64 / 2.0;
+        dx.max(0.0).hypot(dy.max(0.0))
+    };
+    let m = monitors.iter().find(inside).or_else(|| {
+        monitors.iter().min_by(|a, b| distance(a).partial_cmp(&distance(b)).unwrap_or(std::cmp::Ordering::Equal))
+    })?;
+    let (name, x, y, w, h) = m.clone();
+    let (x, y, w, h) = (x as f64, y as f64, w as f64, h as f64);
+    let anchors = [
+        (Dock::Top, x + w / 2.0, y),
+        (Dock::Left, x, y + h / 2.0),
+        (Dock::Right, x + w, y + h / 2.0),
+    ];
+    let dock = anchors
+        .iter()
+        .min_by(|a, b| {
+            let da = (a.1 - cx).hypot(a.2 - cy);
+            let db = (b.1 - cx).hypot(b.2 - cy);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })?
+        .0;
+    Some((name, dock))
+}
+
+static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_MOVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The user started dragging the island: the window manager moves it, and
+/// when the mouse button is let go it snaps to the nearest dock. Snapping on
+/// a pause instead fired mid-drag when the hand stopped for a moment, and the
+/// island then stayed wherever it was dropped.
+pub fn start_drag(app: &AppHandle) {
+    let Some(win) = window(app) else { return };
+    DRAGGING.store(true, Ordering::SeqCst);
+    BUTTON_WATCH.store(false, Ordering::SeqCst);
+    let _ = win.start_dragging();
+    #[cfg(target_os = "linux")]
+    watch_release(app, &win);
+    // A drag the window manager refused never moves anything: stop waiting.
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(20));
+        if DRAGGING.swap(false, Ordering::SeqCst) {
+            snap(&app);
+        }
+    });
+}
+
+/// Polls the mouse button while the window manager drags the island, and
+/// snaps once it is up. When the button state cannot be read at all, the
+/// window's own moves decide instead (`moved`).
+#[cfg(target_os = "linux")]
+fn watch_release(app: &AppHandle, win: &WebviewWindow) {
+    use gtk::prelude::*;
+    let app = app.clone();
+    let handle = win.clone();
+    let _ = win.run_on_main_thread(move || {
+        let Ok(gtk_win) = handle.gtk_window() else { return };
+        let mut seen_down = false;
+        let mut ticks = 0u32;
+        gtk::glib::timeout_add_local(Duration::from_millis(60), move || {
+            ticks += 1;
+            if !DRAGGING.load(Ordering::SeqCst) {
+                return gtk::glib::ControlFlow::Break;
+            }
+            let pointer = gtk_win
+                .window()
+                .zip(gtk::gdk::Display::default().and_then(|d| d.default_seat()).and_then(|s| s.pointer()));
+            let down = pointer.map(|(gdk_win, device)| {
+                let (_, _, _, mask) = gdk_win.device_position(&device);
+                mask.contains(gtk::gdk::ModifierType::BUTTON1_MASK)
+            });
+            match down {
+                Some(true) => {
+                    // The button can be read: it alone decides when the drag ends.
+                    seen_down = true;
+                    BUTTON_WATCH.store(true, Ordering::SeqCst);
+                }
+                Some(false) if seen_down => {
+                    if DRAGGING.swap(false, Ordering::SeqCst) {
+                        // Let the window manager finish placing it first.
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(120));
+                            snap(&app);
+                        });
+                    }
+                    return gtk::glib::ControlFlow::Break;
+                }
+                // Never seen pressed: this display does not tell, the moves decide.
+                _ if !seen_down && ticks > 16 => return gtk::glib::ControlFlow::Break,
+                _ => {}
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+    });
+}
+
+/// Set while the button can be read during a drag: pauses then never snap.
+static BUTTON_WATCH: AtomicBool = AtomicBool::new(false);
+
+/// Called for every move of the island window. Only decides when the mouse
+/// button cannot be read (see `watch_release`), and then waits long enough
+/// that a short pause mid-drag does not count as letting go.
+pub fn moved(app: &AppHandle) {
+    if !DRAGGING.load(Ordering::SeqCst) || BUTTON_WATCH.load(Ordering::SeqCst) {
+        return;
+    }
+    let stamp = LAST_MOVE.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        if LAST_MOVE.load(Ordering::SeqCst) == stamp && DRAGGING.swap(false, Ordering::SeqCst) {
+            snap(&app);
+        }
+    });
+}
+
+fn snap(app: &AppHandle) {
+    let Some(win) = window(app) else { return };
+    let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) else { return };
+    let cx = pos.x as f64 + size.width as f64 / 2.0;
+    let cy = pos.y as f64 + size.height as f64 / 2.0;
+    let monitors: Vec<(String, i32, i32, u32, u32)> = app
+        .available_monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(|m| {
+            let (p, s) = (*m.position(), *m.size());
+            (m.name().cloned().unwrap_or_default(), p.x, p.y, s.width, s.height)
+        })
+        .collect();
+    let Some((screen, dock)) = snap_target(&monitors, cx, cy) else { return };
+    crate::log::line(format!("island docked {} on {screen}", dock.id()));
+    let settings = {
+        let shared = app.state::<crate::Shared>();
+        let mut s = shared.settings.lock().unwrap();
+        s.dock = dock.id().into();
+        s.dock_screen = screen;
+        s.clone()
+    };
+    let _ = crate::settings::save(&settings);
+    let collapsed = app.state::<crate::Shared>().gate.collapsed.load(Ordering::Relaxed);
+    apply_geometry(app, &settings.screen, collapsed);
+    #[cfg(target_os = "linux")]
+    update_input_region(app, &app.state::<crate::Shared>().gate);
+    let _ = app.emit("settings-changed", settings);
+}
+
+#[cfg(test)]
+mod dock_tests {
+    use super::*;
+
+    #[test]
+    fn a_dragged_island_snaps_to_the_nearest_edge_of_its_screen() {
+        let monitors = vec![("DP-1".to_string(), 0, 0, 3440, 1440), ("HDMI-A-2".to_string(), 3440, 0, 1920, 1080)];
+        assert_eq!(snap_target(&monitors, 1720.0, 150.0), Some(("DP-1".into(), Dock::Top)));
+        assert_eq!(snap_target(&monitors, 300.0, 700.0), Some(("DP-1".into(), Dock::Left)));
+        assert_eq!(snap_target(&monitors, 3200.0, 800.0), Some(("DP-1".into(), Dock::Right)));
+        assert_eq!(snap_target(&monitors, 4400.0, 100.0), Some(("HDMI-A-2".into(), Dock::Top)));
+        // Dropped past the last screen: the nearest one.
+        assert_eq!(snap_target(&monitors, 5600.0, 500.0).map(|t| t.0), Some("HDMI-A-2".into()));
+    }
 }

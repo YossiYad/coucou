@@ -119,12 +119,17 @@ fn read_step(response: &Value) -> Result<agent::Turn, String> {
     Ok(agent::Turn::Calls { assistant, calls })
 }
 
-pub fn tool_results(calls: &[agent::Call], outputs: &[String]) -> Vec<Value> {
-    calls
+pub fn tool_results(calls: &[agent::Call], outputs: &[crate::tools::ToolOutput]) -> Vec<Value> {
+    let mut items: Vec<Value> = calls
         .iter()
         .zip(outputs)
-        .map(|(call, output)| json!({ "type": "function_call_output", "call_id": call.id, "output": output }))
-        .collect()
+        .map(|(call, output)| json!({ "type": "function_call_output", "call_id": call.id, "output": output.text }))
+        .collect();
+    // A function's output is text; a picture it returned follows as the user's.
+    for picture in outputs.iter().filter_map(|o| o.image.as_ref()) {
+        items.push(json!({ "role": "user", "content": [{ "type": "input_image", "image_url": picture.data_url() }] }));
+    }
+    items
 }
 
 async fn post(key: &str, body: &Value) -> Result<Value, ai::ApiError> {

@@ -10,6 +10,8 @@ import { h, clear } from "../views/dom";
 let settings: Settings = { ...DEFAULT_SETTINGS };
 /** Puts the permission mode chosen in the island into the select. */
 let syncMode = () => {};
+/** Puts a dock chosen by dragging the island into the selects. */
+let syncPlace = () => {};
 let version = "";
 /** Where API keys live on this platform, for the wording only. */
 let keyStore = "the Windows Credential Manager";
@@ -315,6 +317,51 @@ function aiSection(): HTMLElement {
     }
   });
 
+  const screenScope = h("select", {}) as HTMLSelectElement;
+  screenScope.append(
+    h("option", { value: "mouse", text: "The screen the mouse is on" }),
+    h("option", { value: "all", text: "All screens" }),
+  );
+  screenScope.value = settings.screenScope;
+  screenScope.addEventListener("change", () => {
+    settings.screenScope = screenScope.value as Settings["screenScope"];
+    void save();
+  });
+  const screenRow = h(
+    "div",
+    {},
+    h("div", { class: "row" }, h("label", { text: "Screen to share" }), screenScope),
+    h("div", {
+      class: "hint",
+      text: "The screen button in the chat sends a screenshot with each question, so it can guide you step by step. When it is off and you ask for help with something on the screen, it asks first and shows you the screenshot before anything is sent.",
+    }),
+  );
+
+  const speakToggle = toggle(settings.speakAnswers, (on) => {
+    settings.speakAnswers = on;
+    void save();
+  });
+  const mic = h("select", { style: grow }) as HTMLSelectElement;
+  mic.append(h("option", { value: "", text: "System default" }));
+  void Bridge.listMicrophones().then((list) => {
+    for (const m of list ?? []) mic.append(h("option", { value: m.id, text: m.label }));
+    mic.value = settings.microphone;
+  });
+  mic.addEventListener("change", () => {
+    settings.microphone = mic.value;
+    void save();
+  });
+  const voiceRow = h(
+    "div",
+    {},
+    h("div", { class: "row" }, h("label", { text: "Microphone" }), mic),
+    h("div", { class: "row" }, h("label", { text: "Speak answers" }), speakToggle),
+    h("div", {
+      class: "hint",
+      text: "Talk to it with the microphone button in the chat: click, speak, click again. Your words become text through Gemini (it needs a Gemini key). When this is on, the answer to a spoken question is read out loud.",
+    }),
+  );
+
   const fallbackToggle = toggle(settings.aiFallback, (on) => {
     settings.aiFallback = on;
     void save();
@@ -372,7 +419,7 @@ function aiSection(): HTMLElement {
     h("div", { class: "row" }, h("label", { text: "Changes" }), modeSelect),
     h("div", {
       class: "hint",
-      text: "Find, read and change files in your home folder (text, spreadsheets and Word documents, in place), read web pages and search the web. Hidden files stay off limits. Every change shows as a diff first; Manual waits for Allow, Auto asks only before drastic changes, Accept edits never asks (a backup is kept), Plan changes nothing and proposes a plan. The mode can also be switched from the chat. Local models need tool support, such as qwen3.",
+      text: "Find, read and change files in your home folder (text, spreadsheets and Word documents, in place), read web pages and search the web. Hidden files stay off limits. Every change shows as a diff first; Manual waits for Allow, Auto asks only before what can't be undone (deleting, force-pushing, closing apps, shutting down), Accept edits never asks about files (a backup is kept), Plan changes nothing and proposes a plan. The mode can also be switched from the chat. Local models need tool support, such as qwen3.",
     }),
   );
 
@@ -562,6 +609,8 @@ function aiSection(): HTMLElement {
     customRow,
     h("div", { class: "row" }, h("label", { text: "When it hides" }), onHide),
     fallbackRow,
+    voiceRow,
+    screenRow,
     acting,
     feedback,
   );
@@ -702,8 +751,37 @@ function generalSection(): HTMLElement {
   screen.value = settings.screen;
   screen.addEventListener("change", () => {
     settings.screen = screen.value as Settings["screen"];
+    // Choosing here overrides a screen it was dragged to.
+    settings.dockScreen = "";
     void save();
   });
+
+  // Where on the screen: changed here, or by dragging the island.
+  const dock = h("select", {}) as HTMLSelectElement;
+  dock.append(
+    h("option", { value: "top", text: "Top, centre" }),
+    h("option", { value: "left", text: "Left edge, middle" }),
+    h("option", { value: "right", text: "Right edge, middle" }),
+  );
+  dock.value = settings.dock;
+  dock.addEventListener("change", () => {
+    settings.dock = dock.value as Settings["dock"];
+    void save();
+  });
+  const startOn = h("select", {}) as HTMLSelectElement;
+  startOn.append(
+    h("option", { value: "main", text: "On the main screen" }),
+    h("option", { value: "last", text: "Where I left it" }),
+  );
+  startOn.value = settings.startOnMainScreen ? "main" : "last";
+  startOn.addEventListener("change", () => {
+    settings.startOnMainScreen = startOn.value === "main";
+    void save();
+  });
+  syncPlace = () => {
+    dock.value = settings.dock;
+    startOn.value = settings.startOnMainScreen ? "main" : "last";
+  };
 
   return h(
     "section",
@@ -722,6 +800,15 @@ function generalSection(): HTMLElement {
     h("div", { class: "row" },
       h("label", { text: "Island lives on" }),
       screen,
+    ),
+    h("div", { class: "row" },
+      h("label", { text: "Position" }),
+      dock,
+      h("span", { class: "hint", text: "or drag the island to an edge" }),
+    ),
+    h("div", { class: "row" },
+      h("label", { text: "When it starts" }),
+      startOn,
     ),
     h("div", { class: "row" },
       h("label", { text: "Launch at startup" }),
@@ -766,6 +853,7 @@ async function main() {
   void onEvent<Settings>("settings-changed", (s) => {
     settings = { ...settings, ...s };
     syncMode();
+    syncPlace();
   });
 }
 

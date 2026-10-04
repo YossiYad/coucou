@@ -57,6 +57,39 @@ pub struct Settings {
     /// key), ask the next one this computer can use.
     #[serde(default = "default_true")]
     pub ai_fallback: bool,
+    /// Screen sharing, from the chat's screen button: every question carries
+    /// a screenshot, and the model may look at the screen without asking.
+    #[serde(default)]
+    pub screen_sharing: bool,
+    /// "mouse" (the monitor the mouse is on) or "all".
+    #[serde(default = "default_screen_scope")]
+    pub screen_scope: String,
+    /// Where the island sits: "top" (centre of the top edge), "left" or
+    /// "right" (middle of that edge). Set by dragging it.
+    #[serde(default = "default_dock")]
+    pub dock: String,
+    /// The monitor it was dragged to, by name; empty follows `screen`.
+    #[serde(default)]
+    pub dock_screen: String,
+    /// On every start the island comes up on the main screen, wherever it was
+    /// dragged before; off, it returns to the screen it was left on.
+    #[serde(default = "default_true")]
+    pub start_on_main_screen: bool,
+    /// Read the answer to a spoken question out loud.
+    #[serde(default = "default_true")]
+    pub speak_answers: bool,
+    /// The microphone to listen with (a PipeWire source name); empty is the
+    /// system default.
+    #[serde(default)]
+    pub microphone: String,
+}
+
+fn default_dock() -> String {
+    "top".into()
+}
+
+fn default_screen_scope() -> String {
+    "mouse".into()
 }
 
 fn default_true() -> bool {
@@ -107,6 +140,13 @@ impl Default for Settings {
             tools_enabled: false,
             permission_mode: default_permission_mode(),
             ai_fallback: true,
+            screen_sharing: false,
+            screen_scope: default_screen_scope(),
+            dock: default_dock(),
+            dock_screen: String::new(),
+            start_on_main_screen: true,
+            speak_answers: true,
+            microphone: String::new(),
         }
     }
 }

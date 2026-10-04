@@ -18,6 +18,29 @@ pub struct DroppedFile {
     pub name: String,
     pub path: String,
     pub size: u64,
+    /// The image itself as a data URL, for the chat's thumbnail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// Larger images get no thumbnail rather than megabytes across the bridge.
+const MAX_PREVIEW: u64 = 6 * 1024 * 1024;
+
+/// A data URL of an image file, for showing it small in the chat.
+fn preview(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    let media = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => return None,
+    };
+    if std::fs::metadata(path).ok()?.len() > MAX_PREVIEW {
+        return None;
+    }
+    Some(crate::ai::data_url(media, &std::fs::read(path).ok()?))
 }
 
 pub fn inbox_dir() -> PathBuf {
@@ -65,7 +88,29 @@ pub fn ingest(source: &str) -> Result<DroppedFile, String> {
         name,
         path: dest.to_string_lossy().to_string(),
         size: meta.len(),
+        preview: preview(&dest),
     })
+}
+
+/// A file Coucou wrote into the inbox itself (a screenshot), described like an
+/// ingested one.
+pub fn ingest_existing(path: &Path) -> Result<DroppedFile, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    sweep(&inbox_dir());
+    Ok(DroppedFile {
+        name: path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+        path: path.to_string_lossy().to_string(),
+        size: meta.len(),
+        preview: preview(path),
+    })
+}
+
+/// A file in the inbox, as a real path: the island may open those and nothing
+/// else.
+pub fn in_inbox(path: &str) -> Option<PathBuf> {
+    let inbox = inbox_dir().canonicalize().ok()?;
+    let real = Path::new(path).canonicalize().ok()?;
+    (real.starts_with(&inbox) && real.is_file()).then_some(real)
 }
 
 /// Largest pasted image taken: a full-screen screenshot is a few MB.
@@ -104,6 +149,7 @@ pub fn ingest_bytes(kind: &str, bytes: &[u8]) -> Result<DroppedFile, String> {
         name: dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
         path: dest.to_string_lossy().to_string(),
         size: bytes.len() as u64,
+        preview: preview(&dest),
     })
 }
 
@@ -158,9 +204,13 @@ mod tests {
         let png = ingest_bytes("image/png", b"\x89PNG fake").unwrap();
         assert!(png.name.starts_with("Pasted image ") && png.name.ends_with(".png"), "{}", png.name);
         assert_eq!(std::fs::read(&png.path).unwrap(), b"\x89PNG fake");
+        assert!(png.preview.as_deref().is_some_and(|p| p.starts_with("data:image/png;base64,")));
         let again = ingest_bytes("image/png", b"second").unwrap();
         assert_ne!(png.path, again.path, "a second paste in the same second must not overwrite the first");
         assert!(ingest_bytes("text/html", b"<b>x</b>").is_err());
+        assert!(in_inbox(&png.path).is_some(), "a pasted image may be opened");
+        assert!(in_inbox("/etc/passwd").is_none(), "nothing outside the inbox may be");
+        assert!(in_inbox(&format!("{}/../../../../etc/passwd", inbox_dir().display())).is_none());
         assert!(ingest_bytes("image/png", b"").is_err());
         let _ = std::fs::remove_file(&png.path);
         let _ = std::fs::remove_file(&again.path);
@@ -175,6 +225,7 @@ mod tests {
 
         let first = ingest(source.to_str().unwrap()).unwrap();
         assert_eq!(first.name, "note.txt");
+        assert!(first.preview.is_none(), "only images get a thumbnail");
         assert_eq!(std::fs::read(&first.path).unwrap(), b"hello");
 
         // A second drop of the same name must not clobber the first copy.

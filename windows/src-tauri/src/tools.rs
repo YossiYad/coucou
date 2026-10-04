@@ -31,10 +31,6 @@ const SEARCH_LIMIT: usize = 30;
 const SEARCH_BUDGET: Duration = Duration::from_secs(8);
 /// Folders full of generated files nobody searches for by name.
 const SKIP_DIRS: &[&str] = &["node_modules", "target", "__pycache__", "venv", "site-packages"];
-/// In auto mode, deleting more than this many rows, columns or paragraphs at
-/// once (or replacing a whole file) still asks first.
-const AUTO_DELETE_LIMIT: usize = 5;
-const AUTO_REMOVED_LINES: usize = 20;
 /// Lines of a file or result shown in the work view while it is read.
 const EXCERPT_LINES: usize = 14;
 pub const DECLINED: &str = "The user declined.";
@@ -45,8 +41,9 @@ const PLAN_REFUSAL: &str = "Plan mode is on, so nothing was changed.";
 pub enum Mode {
     /// Every change waits for Allow.
     Manual,
-    /// Changes go through, except drastic ones: a whole file replaced, or many
-    /// rows, columns, paragraphs or lines deleted at once.
+    /// Asks only before what cannot be undone: file changes go through (a
+    /// backup is always kept), and commands run unless they delete, wipe,
+    /// force-push, close apps or shut down.
     Auto,
     /// Every change goes through; each is still shown, and a backup kept.
     AcceptEdits,
@@ -72,6 +69,12 @@ impl Mode {
             Self::Plan => "plan",
         }
     }
+}
+
+/// Whether a tool changes something on the computer (a file, or whatever a
+/// command does), as opposed to only reading or looking.
+pub fn changes_things(name: &str) -> bool {
+    WRITE_TOOLS.contains(&name)
 }
 
 /// Tools that change something, which plan mode never offers.
@@ -228,6 +231,13 @@ system, anything the terminal can do. The user sees the command and approves it 
                 "why": { "type": "string", "description": "One short sentence for the user on what it does" },
             }),
             &["command", "why"]),
+        tool("look_at_screen",
+            "Take a screenshot of the user's screen and see it. Use it whenever the user asks for help with something on \
+their screen (an app, a setting, an error, where to click), then guide them one step at a time from what is visible.",
+            json!({
+                "all_screens": { "type": "boolean", "description": "Every monitor instead of the one the mouse is on" },
+            }),
+            &[]),
         tool("open",
             "Open a file or folder in its usual app, or a web link in the browser, for the user to see.",
             json!({ "target": { "type": "string", "description": "A path or an http(s) link" } }),
@@ -243,9 +253,30 @@ system, anything the terminal can do. The user sees the command and approves it 
 
 static STEPS: AtomicU64 = AtomicU64::new(0);
 
+/// A tool's answer: text for the model, and sometimes a picture it should see.
+pub struct ToolOutput {
+    pub text: String,
+    pub image: Option<Picture>,
+}
+
+pub struct Picture {
+    pub media: &'static str,
+    pub data: Vec<u8>,
+}
+
+impl Picture {
+    pub fn data_url(&self) -> String {
+        ai::data_url(self.media, &self.data)
+    }
+
+    pub fn base64(&self) -> String {
+        ai::base64(&self.data)
+    }
+}
+
 /// Runs one tool call. Failures come back as text for the model to read, so it
 /// can correct itself or tell the user. Each call is a step in the work view.
-pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value, mode: Mode) -> String {
+pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value, mode: Mode) -> ToolOutput {
     let arg = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
     let part = args.get("part").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
     let step = STEPS.fetch_add(1, Ordering::SeqCst) + 1;
@@ -260,8 +291,18 @@ pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value, mode:
         "agent-step",
         json!({ "id": step, "tool": name, "target": shown, "path": target, "state": "running" }),
     );
+    let mut image = None;
     let text = if mode == Mode::Plan && WRITE_TOOLS.contains(&name) {
         format!("{PLAN_REFUSAL} Describe this change in your plan instead.")
+    } else if name == "look_at_screen" {
+        let all = args.get("all_screens").and_then(Value::as_bool).unwrap_or(false);
+        match look_at_screen(app, step, all, mode).await {
+            Ok((text, picture)) => {
+                image = picture;
+                text
+            }
+            Err(e) => format!("Error: {e}"),
+        }
     } else {
         run_tool(app, name, args, step, mode, &arg, part).await.unwrap_or_else(|e| format!("Error: {e}"))
     };
@@ -275,11 +316,44 @@ pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value, mode:
         "done"
     };
     let mut done = json!({ "id": step, "state": state });
-    if state == "done" && !WRITE_TOOLS.contains(&name) && name != "open" {
+    if state == "done" && !WRITE_TOOLS.contains(&name) && name != "open" && name != "look_at_screen" {
         done["lines"] = json!(preview::excerpt(&text, EXCERPT_LINES));
     }
     let _ = app.emit_to(WINDOW_LABEL, "agent-step", done);
-    text
+    ToolOutput { text, image }
+}
+
+/// A screenshot for the model. With screen sharing on it is taken and shown in
+/// the work view; otherwise the user sees it first and allows this one.
+async fn look_at_screen<R: Runtime>(
+    app: &AppHandle<R>,
+    step: u64,
+    all: bool,
+    mode: Mode,
+) -> Result<(String, Option<Picture>), String> {
+    let (sharing, scope_all) = {
+        let shared = app.state::<crate::Shared>();
+        let settings = shared.settings.lock().unwrap();
+        (settings.screen_sharing, settings.screen_scope == "all")
+    };
+    let shot = tauri::async_runtime::spawn_blocking(move || crate::screen::capture(all || scope_all))
+        .await
+        .map_err(|e| e.to_string())??;
+    crate::frame::flash(app, all || scope_all);
+    let data = std::fs::read(&shot.path).map_err(|e| e.to_string())?;
+    let picture = Picture { media: "image/jpeg", data };
+    let shown = Preview::Image { src: shot.preview.clone().unwrap_or_else(|| picture.data_url()) };
+    // Mode::Manual here only means "this may wait": plan mode may look too.
+    let ask = !sharing && mode != Mode::Auto;
+    let allowed = present(app, step, Mode::Manual, "Let it see your screen?", "Screen", "", shown, ask).await;
+    if !allowed {
+        let _ = std::fs::remove_file(&shot.path);
+        return Ok((format!("{DECLINED} The screen was not shared. Ask the user to describe what they see."), None));
+    }
+    Ok((
+        "Here is the user's screen right now (the screenshot is attached). Guide them from what is visible.".into(),
+        Some(picture),
+    ))
 }
 
 async fn run_tool<R: Runtime>(
@@ -689,7 +763,7 @@ async fn create_file<R: Runtime>(
         FileBody::Text(text) => Preview::Text { lines: preview::text_diff(&old, text) },
     };
     let title = if exists { "Replace the file" } else { "Create the file" };
-    if !approve(app, step, mode, title, &target, preview, exists).await {
+    if !approve(app, step, mode, title, &target, preview).await {
         return Ok(format!("{DECLINED} Nothing was written."));
     }
     let mut note = String::new();
@@ -868,8 +942,7 @@ async fn edit_spreadsheet<R: Runtime>(
 
     let mut book = umya_spreadsheet::reader::xlsx::read(&target).map_err(|e| format!("Could not open it: {e}"))?;
     let preview = sheet_preview(open_sheet(&mut book, sheet)?, &rows, &columns, &cells);
-    let drastic = rows.len() + columns.len() > AUTO_DELETE_LIMIT;
-    if !approve(app, step, mode, "Change the spreadsheet", &target, preview, drastic).await {
+    if !approve(app, step, mode, "Change the spreadsheet", &target, preview).await {
         return Ok(format!("{DECLINED} The spreadsheet is unchanged."));
     }
 
@@ -957,8 +1030,7 @@ async fn edit_document<R: Runtime>(app: &AppHandle<R>, (step, mode): (u64, Mode)
 
     let doc = docx::open(&target)?;
     let plan = doc.plan(&edits)?;
-    let drastic = plan.deletions > AUTO_DELETE_LIMIT;
-    if !approve(app, step, mode, "Change the document", &target, plan.preview, drastic).await {
+    if !approve(app, step, mode, "Change the document", &target, plan.preview).await {
         return Ok(format!("{DECLINED} The document is unchanged."));
     }
     // Planned again on the file as it is now, in case it changed meanwhile.
@@ -1002,13 +1074,13 @@ async fn edit_file<R: Runtime>(
     }
     let changed = text.replacen(find, replace, 1);
     let lines = preview::text_diff(&text, &changed);
-    let removed = lines.iter().filter(|l| l.mark == Mark::Removed).count();
-    let drastic = removed > AUTO_REMOVED_LINES;
-    if !approve(app, step, mode, "Edit the file", &target, Preview::Text { lines }, drastic).await {
+    if !approve(app, step, mode, "Edit the file", &target, Preview::Text { lines }).await {
         return Ok(format!("{DECLINED} The file is unchanged."));
     }
+    let backup = backup_path(&target);
+    std::fs::copy(&target, &backup).map_err(|e| format!("Could not keep a backup: {e}"))?;
     std::fs::write(&target, changed).map_err(|e| e.to_string())?;
-    Ok(format!("Edited {}.", tilde(&target)))
+    Ok(format!("Edited {}. The previous version is kept as {}.", tilde(&target), tilde(&backup)))
 }
 
 fn open(target: &str) -> Result<String, String> {
@@ -1163,11 +1235,11 @@ async fn approve<R: Runtime>(
     title: &str,
     target: &Path,
     preview: Preview,
-    drastic: bool,
 ) -> bool {
+    // Every file change keeps a backup, so in Auto none of them has to wait.
     let waiting = match mode {
         Mode::Manual => true,
-        Mode::Auto => drastic,
+        Mode::Auto => false,
         Mode::AcceptEdits => false,
         Mode::Plan => return false,
     };

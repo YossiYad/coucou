@@ -147,19 +147,20 @@ export async function registerWorkHandlers(island: Island) {
 
   await onEvent<{ id: number; allowed: boolean }>("agent-change-done", ({ id, allowed }) => {
     const panel = State.work?.panel;
-    if (!panel || panel.changeId !== id) return;
-    const wasWaiting = panel.approvalId != null;
-    panel.approvalId = undefined;
-    panel.outcome = allowed ? "applied" : "declined";
-    // Approved: the step carries on (a command now runs) until Rust says it is done.
-    const step = State.work?.steps.find((s) => s.id === panel.stepId);
-    if (allowed && step?.state === "waiting") step.state = "running";
-    if (wasWaiting) {
-      // Timed out unanswered.
+    if (panel && panel.changeId === id) {
+      panel.approvalId = undefined;
+      panel.outcome = allowed ? "applied" : "declined";
+      // Approved: the step carries on (a command now runs) until Rust says it is done.
+      const step = State.work?.steps.find((s) => s.id === panel.stepId);
+      if (allowed && step?.state === "waiting") step.state = "running";
+    }
+    // Nothing left waiting for a click: the island may close on its own again,
+    // whichever change this was (a pin left behind kept it open for good).
+    const stillWaiting = State.work?.panel?.approvalId != null || !!State.work?.panel?.hookRequestId || !!State.pendingApproval;
+    if (!stillWaiting) {
       State.isPinned = false;
       island.dropPin();
     }
-    State.isPinned = false;
     State.notify();
   });
 

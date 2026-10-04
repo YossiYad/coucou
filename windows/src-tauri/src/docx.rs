@@ -44,8 +44,6 @@ pub struct Edits {
 pub struct Plan {
     pub xml: String,
     pub preview: Preview,
-    /// Paragraphs and rows that would go.
-    pub deletions: usize,
 }
 
 pub fn open(path: &Path) -> Result<Document, String> {
@@ -205,7 +203,6 @@ impl Document {
         // Display: per entry index, (mark, new text); and new blocks after an entry.
         let mut marks: Vec<Option<(Mark, Option<String>)>> = vec![None; entries.len()];
         let mut added: Vec<(Option<usize>, Vec<String>)> = Vec::new();
-        let mut deletions = 0;
 
         for &n in &edits.delete_paragraphs {
             let i = entries
@@ -214,7 +211,6 @@ impl Document {
                 .ok_or_else(|| format!("There is no paragraph {n}. Read the document again for the numbers."))?;
             splices.push((entries[i].span, String::new()));
             marks[i] = Some((Mark::Removed, None));
-            deletions += 1;
         }
 
         let mut tables: Vec<u32> = edits.delete_rows.iter().map(|(t, _)| *t).collect();
@@ -249,8 +245,7 @@ impl Document {
                     splices.push((entries[i].span, String::new()));
                 }
                 marks[i] = Some((Mark::Removed, None));
-                deletions += 1;
-            }
+                }
         }
 
         for (only, find, replace) in &edits.replace {
@@ -298,7 +293,7 @@ impl Document {
             return Err("Say what to change: delete_paragraphs, delete_table_rows, replace or insert.".into());
         }
         let xml = apply(&self.xml, splices)?;
-        Ok(Plan { xml, preview: self.preview(&entries, &marks, &added), deletions })
+        Ok(Plan { xml, preview: self.preview(&entries, &marks, &added) })
     }
 
     fn preview(&self, entries: &[Entry], marks: &[Option<(Mark, Option<String>)>], added: &[(Option<usize>, Vec<String>)]) -> Preview {
@@ -522,7 +517,6 @@ mod tests {
         let plan = d.plan(&Edits { delete_paragraphs: vec![2], delete_rows: vec![(1, 2)], ..Default::default() }).unwrap();
         let after = parse(plan.xml).unwrap();
         assert_eq!(after.numbered_text(), "[¶1] Keep\n[table 1 row 1] A\n[table 1 row 2] C");
-        assert_eq!(plan.deletions, 2);
     }
 
     #[test]

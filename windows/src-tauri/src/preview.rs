@@ -64,6 +64,8 @@ pub enum Preview {
     Text { lines: Vec<Line> },
     Table { sheet: String, columns: Vec<Head>, rows: Vec<Row> },
     Doc { blocks: Vec<Block> },
+    /// A picture, like the screenshot the model is about to see.
+    Image { src: String },
 }
 
 /// Unchanged lines kept around each part of a change.

@@ -87,6 +87,16 @@ export const Bridge = {
   chatReset: () => call<void>("chat_reset"),
   /** The models a provider offers, asked from the provider itself. */
   aiModels: (provider: string, start = false) => callOrThrow<ModelInfo[]>("ai_models", { provider, start }),
+  /** The microphone: listen, then stop and get the words as text. */
+  voiceStart: () => callOrThrow<void>("voice_start"),
+  voiceStop: () => callOrThrow<string>("voice_stop"),
+  voiceCancel: () => call<void>("voice_cancel"),
+  listMicrophones: () => call<{ id: string; label: string }[]>("list_microphones"),
+  /** Reads text out loud, and stops reading. */
+  speak: (text: string) => call<void>("speak", { text }),
+  stopSpeaking: () => call<void>("stop_speaking"),
+  /** Hands the island to the window manager to drag; it snaps to an edge after. */
+  startDrag: () => call<void>("start_drag"),
   /** Ends a command the chat model is running. */
   stopCommand: (step: number) => call<void>("stop_command", { step }),
   /** What a Claude Code edit will do to its file, as a diff. */
@@ -101,6 +111,10 @@ export const Bridge = {
   },
   /** The clipboard's image, read by the app when the web view does not pass it on. */
   pasteClipboardImage: () => callOrThrow<DroppedFile>("paste_clipboard_image"),
+  /** A screenshot of the screen (the mouse's monitor, or all), saved in the inbox. */
+  captureScreen: (all: boolean) => callOrThrow<DroppedFile>("capture_screen", { all }),
+  /** Opens a received file (a pasted image) in its usual app. */
+  openInboxFile: (path: string) => callOrThrow<void>("open_inbox_file", { path }),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
   /** Only ever tells you whether a key exists — never its value. */
@@ -134,6 +148,8 @@ export interface ModelInfo {
 }
 
 export interface DroppedFile {
+  /** The image as a data URL, when it is one, for the chat's thumbnail. */
+  preview?: string;
   name: string;
   path: string;
   size: number;

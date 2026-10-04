@@ -8,6 +8,7 @@ mod docx;
 mod extract;
 mod fallback;
 mod files;
+mod frame;
 mod gemini;
 mod hooks;
 mod integrations;
@@ -25,8 +26,10 @@ mod log;
 mod pipe;
 mod secrets;
 mod settings;
+mod screen;
 mod shell;
 mod tray;
+mod voice;
 #[cfg(windows)]
 mod win_user;
 
@@ -86,7 +89,10 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
 fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     let (screen_changed, autostart_changed) = {
         let mut current = shared.settings.lock().unwrap();
-        let screen_changed = current.screen != settings.screen;
+        // A new edge or screen (from Settings) places the island again.
+        let screen_changed = current.screen != settings.screen
+            || current.dock != settings.dock
+            || current.dock_screen != settings.dock_screen;
         let autostart_changed = current.autostart != settings.autostart;
         *current = settings.clone();
         (screen_changed, autostart_changed)
@@ -104,6 +110,8 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     if screen_changed {
         let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
         island::apply_geometry(&app, &settings.screen, collapsed);
+        #[cfg(target_os = "linux")]
+        island::update_input_region(&app, &shared.gate);
     }
     // Keep the other window in step (island ⇄ settings window).
     let _ = app.emit("settings-changed", settings);
@@ -321,6 +329,47 @@ fn tool_decision(app: AppHandle, id: u64, allow: bool) {
     tools::decide(&app, id, allow);
 }
 
+/// The chat's microphone button: start listening.
+#[tauri::command]
+fn voice_start(app: AppHandle) -> Result<(), String> {
+    voice::start(&app)
+}
+
+/// Stop listening and turn what was said into text.
+#[tauri::command]
+async fn voice_stop(app: AppHandle) -> Result<String, String> {
+    voice::stop(&app).await
+}
+
+#[tauri::command]
+fn voice_cancel(app: AppHandle) {
+    voice::cancel(&app);
+}
+
+/// The microphones to choose from in Settings.
+#[tauri::command]
+fn list_microphones() -> Vec<voice::Microphone> {
+    voice::microphones()
+}
+
+/// Reads an answer out loud.
+#[tauri::command]
+fn speak(text: String) {
+    voice::speak(&text);
+}
+
+#[tauri::command]
+fn stop_speaking() {
+    voice::stop_speaking();
+}
+
+/// The island is being dragged by the mouse: the window manager moves it and
+/// it snaps to the nearest dock when let go.
+#[tauri::command]
+fn start_drag(app: AppHandle) {
+    island::start_drag(&app);
+}
+
 /// The work view's Stop button on a running command.
 #[tauri::command]
 fn stop_command(app: AppHandle, step: u64) {
@@ -365,6 +414,31 @@ fn ingest_pasted(request: tauri::ipc::Request<'_>) -> Result<DroppedFile, String
     };
     let kind = request.headers().get("x-type").and_then(|v| v.to_str().ok()).unwrap_or("image/png");
     files::ingest_bytes(kind, bytes)
+}
+
+/// Opens a pasted or dropped file from the inbox in its usual app, to see an
+/// image full size. Paths outside the inbox are refused.
+#[tauri::command]
+fn open_inbox_file(path: String) -> Result<(), String> {
+    let file = files::in_inbox(&path).ok_or_else(|| "Only files Coucou received can be opened.".to_string())?;
+    #[cfg(target_os = "linux")]
+    {
+        linux::clean_env(&mut Command::new("xdg-open")).arg(&file).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(windows)]
+    {
+        Command::new("explorer.exe").arg(&file).creation_flags(CREATE_NO_WINDOW).spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// A screenshot for the chat, from the screen button: saved in the inbox and
+/// attached to the question like a pasted image.
+#[tauri::command]
+async fn capture_screen(app: AppHandle, all: bool) -> Result<DroppedFile, String> {
+    let shot = tauri::async_runtime::spawn_blocking(move || screen::capture(all)).await.map_err(|e| e.to_string())??;
+    frame::flash(&app, all);
+    Ok(shot)
 }
 
 /// The image on the system clipboard, when the web view did not pass it on.
@@ -479,7 +553,13 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     linux::prepare_env();
 
-    let loaded = settings::load();
+    let mut loaded = settings::load();
+    // Every start begins on the main screen unless the user chose otherwise;
+    // the edge it was docked to is kept.
+    if loaded.start_on_main_screen && !loaded.dock_screen.is_empty() {
+        loaded.dock_screen.clear();
+        let _ = settings::save(&loaded);
+    }
     let gate = Arc::new(PollGate::new());
 
     tauri::Builder::default()
@@ -495,12 +575,22 @@ pub fn run() {
         .manage(Chat::default())
         .manage(tools::Approvals::default())
         .manage(shell::Running::default())
+        .manage(voice::Recorder::default())
         .invoke_handler(tauri::generate_handler![
             boot,
             change_preview,
             stop_command,
+            start_drag,
+            voice_start,
+            voice_stop,
+            voice_cancel,
+            speak,
+            stop_speaking,
+            list_microphones,
             ingest_pasted,
             paste_clipboard_image,
+            open_inbox_file,
+            capture_screen,
             save_settings,
             set_collapsed,
             set_island_rect,
@@ -542,6 +632,7 @@ pub fn run() {
             }
             // Before the island: see create_settings_window.
             create_settings_window(&handle);
+            frame::create(&handle);
 
             if let Some(win) = island::window(&handle) {
                 island::make_non_activating(&win);
@@ -551,6 +642,12 @@ pub fn run() {
                     island::watch_pointer_crossing(&handle, &win);
                 }
                 island::apply_geometry(&handle, &loaded.screen, false);
+                let moved = handle.clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Moved(_) = event {
+                        island::moved(&moved);
+                    }
+                });
                 let _ = win.show();
             }
             gate.collapsed.store(false, Ordering::Relaxed);

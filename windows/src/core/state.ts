@@ -34,6 +34,10 @@ export interface ChatMessage {
   content: string;
   /** Another model answered because the chosen one could not. */
   note?: string;
+  /** The image the user sent with this message, shown small above it. */
+  image?: string;
+  /** Where that image is kept, to open it full size. */
+  imagePath?: string;
 }
 
 export type PromptContext =
@@ -113,6 +117,20 @@ export interface Settings {
   permissionMode: PermissionMode;
   /** When the chosen model cannot answer, ask another model or account. */
   aiFallback: boolean;
+  /** Screen sharing: every question carries a screenshot. */
+  screenSharing: boolean;
+  /** "mouse": the monitor the mouse is on; "all": every monitor. */
+  screenScope: "mouse" | "all";
+  /** The edge the island is docked to, set by dragging it. */
+  dock: "top" | "left" | "right";
+  /** The monitor it was dragged to; empty follows `screen`. */
+  dockScreen: string;
+  /** Start on the main screen every time, wherever it was dragged before. */
+  startOnMainScreen: boolean;
+  /** Read the answer to a spoken question out loud. */
+  speakAnswers: boolean;
+  /** The microphone to listen with; empty is the system default. */
+  microphone: string;
 }
 
 export type PermissionMode = "manual" | "auto" | "acceptEdits" | "plan";
@@ -120,7 +138,7 @@ export type PermissionMode = "manual" | "auto" | "acceptEdits" | "plan";
 /** Claude Code's modes, as they apply to the chat model's changes. */
 export const PERMISSION_MODES: { id: PermissionMode; label: string; hint: string }[] = [
   { id: "manual", label: "Manual", hint: "Always ask before making changes" },
-  { id: "auto", label: "Auto", hint: "Ask only before drastic changes" },
+  { id: "auto", label: "Auto", hint: "Ask only before what can't be undone" },
   { id: "acceptEdits", label: "Accept edits", hint: "Make every change, keep a backup" },
   { id: "plan", label: "Plan", hint: "Change nothing, propose a plan" },
 ];
@@ -144,7 +162,8 @@ export type Preview =
       columns: { label: string; mark: Mark }[];
       rows: { label: string; mark: Mark; cells: { text: string; old: string | null; mark: Mark }[] }[];
     }
-  | { kind: "doc"; blocks: { label: string; mark: Mark; text: string; old: string | null }[] };
+  | { kind: "doc"; blocks: { label: string; mark: Mark; text: string; old: string | null }[] }
+  | { kind: "image"; src: string };
 
 export type StepState = "running" | "done" | "failed" | "declined" | "skipped" | "waiting";
 
@@ -226,6 +245,13 @@ export const DEFAULT_SETTINGS: Settings = {
   toolsEnabled: false,
   permissionMode: "manual",
   aiFallback: true,
+  screenSharing: false,
+  screenScope: "mouse",
+  dock: "top",
+  dockScreen: "",
+  startOnMainScreen: true,
+  speakAnswers: true,
+  microphone: "",
 };
 
 type Listener = () => void;
@@ -258,6 +284,8 @@ class AppState {
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
   pendingApproval: ApprovalInfo | null = null;
+  /** A picture is open large over the chat: the island takes its full height. */
+  imageOpen = false;
   /** The chat model's or Claude Code's steps and current change. */
   work: WorkSession | null = null;
   /** The mode the chat ran in when it last answered, for "Go ahead" after a plan. */

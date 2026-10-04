@@ -189,6 +189,31 @@ pub fn adopt(answer: Answer, provider: Provider) -> Answer {
     Answer { stored: stored_text(provider, &answer.text), text: answer.text }
 }
 
+/// Separates an error from the steps already done, inside one error string.
+const PROGRESS: char = '\u{1e}';
+
+/// An error from a model that had already changed things, with what it did.
+pub fn with_progress(err: &str, steps: &[String]) -> String {
+    format!("{err}{PROGRESS}{}", steps.join("\n"))
+}
+
+/// The error alone, and the steps already done (empty when none).
+pub fn split_progress(err: &str) -> (String, Vec<String>) {
+    match err.split_once(PROGRESS) {
+        Some((message, steps)) => (message.to_string(), steps.lines().map(str::to_string).collect()),
+        None => (err.to_string(), Vec::new()),
+    }
+}
+
+/// What the next model is told when it takes over half-way.
+pub fn carry_on(steps: &[String]) -> String {
+    format!(
+        "\n\n(Another assistant started on this and stopped half-way. It already did these steps; do not repeat \
+them, check where things stand if you need to, and finish the request:\n- {})",
+        steps.join("\n- ")
+    )
+}
+
 /// A short reason for the note under the answer.
 pub fn reason(err: &str) -> &'static str {
     let e = err.to_lowercase();
@@ -260,6 +285,17 @@ mod tests {
         assert_eq!(list[0], Target::new(Provider::Gemini, flash, 1));
         assert!(!list.iter().any(|t| t.provider == Provider::Local));
         assert_eq!(Target::new(Provider::Gemini, flash, 2).name(), "Gemini (account 2)");
+    }
+
+    #[test]
+    fn steps_already_done_travel_with_the_error() {
+        let err = with_progress("Gemini's free quota is used up", &["run_command  -> Finished".into(), "edit_file a.txt -> Edited".into()]);
+        assert!(worth_another(&err));
+        let (message, steps) = split_progress(&err);
+        assert_eq!(message, "Gemini's free quota is used up");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(split_progress("plain"), ("plain".to_string(), vec![]));
+        assert!(carry_on(&steps).contains("do not repeat"));
     }
 
     #[test]

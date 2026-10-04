@@ -111,11 +111,20 @@ fn read_step(response: &Value) -> Result<agent::Turn, String> {
 }
 
 /// Every result of one turn's calls, in one user message as the API wants.
-pub fn tool_results(calls: &[agent::Call], outputs: &[String]) -> Vec<Value> {
+pub fn tool_results(calls: &[agent::Call], outputs: &[crate::tools::ToolOutput]) -> Vec<Value> {
     let content: Vec<Value> = calls
         .iter()
         .zip(outputs)
-        .map(|(call, output)| json!({ "type": "tool_result", "tool_use_id": call.id, "content": output }))
+        .map(|(call, output)| {
+            let body = match &output.image {
+                None => json!(output.text),
+                Some(picture) => json!([
+                    { "type": "text", "text": output.text },
+                    { "type": "image", "source": { "type": "base64", "media_type": picture.media, "data": picture.base64() } },
+                ]),
+            };
+            json!({ "type": "tool_result", "tool_use_id": call.id, "content": body })
+        })
         .collect();
     vec![json!({ "role": "user", "content": content })]
 }

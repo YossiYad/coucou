@@ -35,7 +35,7 @@ pub fn prompt(web_search: bool, mode: Mode) -> String {
     let (y, mo, d, ..) = crate::clock::local_now();
     let home = std::env::var("HOME").unwrap_or_default();
     let mut text = format!(
-        "{}\n\nYou can act on the user's computer with tools: find files, list folders, read files (long ones part by part, \
+        "{}\n\nYou can see the user's screen with look_at_screen and act on their computer with tools: find files, list folders, read files (long ones part by part, \
 PDFs page by page), create and change files (text, spreadsheets and Word documents, in place; the user sees every change), \
 read web pages and follow their links, search the web, and open files or links for the user. Use them whenever the answer \
 depends on the user's files or on current information, instead of guessing or saying you can't. When the user asks you to \
@@ -45,6 +45,12 @@ file before changing it, and use the row, column and paragraph numbers read_file
 their desktop is {home}/Desktop and their documents are in {home}/Documents. Today is {y:04}-{mo:02}-{d:02}. Read only as \
 much of a long file as the question needs.",
         crate::ai::system_prompt(web_search)
+    );
+    text.push_str(
+        "\n\nWhen the user asks for help with something on their screen, look at it, then guide them like a patient \
+friend sitting next to them: one step at a time, naming exactly what to click and where it is on the screen (top left, \
+the blue button at the bottom...), and ask them to say when it is done. A message that arrives with a screenshot of \
+their screen shows where they are now.",
     );
     text.push_str("\n\n");
     text.push_str(&crate::shell::system_note());
@@ -72,6 +78,10 @@ pub async fn run<R: Runtime>(
     let system = prompt(matches!(provider, Provider::Anthropic | Provider::OpenAi), mode);
     let mut messages = history.to_vec();
     let mut used: Vec<String> = Vec::new();
+    // Whether anything was changed yet: until then another model can simply
+    // start the question over. After that it carries on from `progress`.
+    let mut changed = false;
+    let mut progress: Vec<String> = Vec::new();
 
     for _ in 0..MAX_STEPS {
         let step = match provider {
@@ -82,13 +92,12 @@ pub async fn run<R: Runtime>(
         };
         let turn = match step {
             Ok(turn) => turn,
-            Err(err) if used.is_empty() => return Err(err),
-            // Files may already have changed: say so, and keep it in the
-            // conversation, rather than an error that drops the whole turn.
+            Err(err) if !changed => return Err(err),
+            // Something was already changed: the next model gets told what, so
+            // it carries on instead of doing it twice.
             Err(err) => {
-                let text = format!("I could not finish: {err}\n\nWhat was already done stays done: {}.", used.join("; "));
-                crate::log::line("agent: stopped after using tools");
-                return Ok(Answer { stored: crate::fallback::stored_text(provider, &text), text });
+                crate::log::line(format!("agent: stopped after changing things: {err}"));
+                return Err(crate::fallback::with_progress(&err, &progress));
             }
         };
         match turn {
@@ -110,9 +119,22 @@ pub async fn run<R: Runtime>(
                 let mut outputs = Vec::with_capacity(calls.len());
                 for call in &calls {
                     let output = tools::run(app, &call.name, &call.args, mode).await;
-                    let outcome = if output.starts_with("Error:") { output.as_str() } else { "ok" };
+                    let outcome = if output.text.starts_with("Error:") { output.text.as_str() } else { "ok" };
                     crate::log::line(format!("tool: {} {} -> {outcome}", call.name, summary(&call.args)));
                     used.push(format!("{} {}", call.name, summary(&call.args)));
+                    let did_change = !output.text.starts_with(tools::DECLINED)
+                        && if call.name == "run_command" {
+                            !crate::shell::is_read_only(call.args.get("command").and_then(Value::as_str).unwrap_or(""))
+                        } else {
+                            tools::changes_things(&call.name)
+                        };
+                    changed |= did_change;
+                    progress.push(format!(
+                        "{} {} -> {}",
+                        call.name,
+                        summary(&call.args),
+                        crate::extract::clip(output.text.lines().next().unwrap_or(""), 200)
+                    ));
                     outputs.push(output);
                 }
                 messages.extend(results(provider, &calls, &outputs));
@@ -122,7 +144,7 @@ pub async fn run<R: Runtime>(
     Err("That took too many steps. Try asking for something narrower.".into())
 }
 
-fn results(provider: Provider, calls: &[Call], outputs: &[String]) -> Vec<Value> {
+fn results(provider: Provider, calls: &[Call], outputs: &[tools::ToolOutput]) -> Vec<Value> {
     match provider {
         Provider::Anthropic => claude::tool_results(calls, outputs),
         Provider::OpenAi => openai::tool_results(calls, outputs),
@@ -161,7 +183,7 @@ pub fn arguments(raw: Option<&Value>) -> Value {
 /// What a call was about, for the log and the conversation: paths and queries,
 /// never file contents.
 pub fn summary(args: &Value) -> String {
-    ["path", "query", "url", "target"]
+    ["path", "query", "url", "target", "command"]
         .iter()
         .filter_map(|k| args.get(*k).and_then(Value::as_str))
         .map(|v| v.chars().take(80).collect::<String>())

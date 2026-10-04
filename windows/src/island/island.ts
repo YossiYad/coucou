@@ -4,7 +4,7 @@
 import { Tracked, Spring, clamp } from "../core/anim";
 import { Bridge, IS_TAURI, onDragDrop, type DragDropPayload } from "../core/bridge";
 import {
-  EXPANDED_CORNER, EXPANDED_W, NOTCH_W, PANEL_H, PANEL_W,
+  EXPANDED_CORNER, EXPANDED_W, NOTCH_H, NOTCH_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, VIEW_LAYOUTS, botGlowColor, botGlowOpacity, botPosition, chatPromptHeight,
   islandSize,
   type IslandMode, type IslandViewName,
@@ -463,7 +463,7 @@ export class Island {
 
     void Bridge.ingestFile(path)
       .then((file) => {
-        State.droppedFile = { name: file.name, path: file.path, original: path };
+        State.droppedFile = { name: file.name, path: file.path, original: path, preview: file.preview };
         State.promptContext = { kind: "file", name: file.name, path: file.path };
         State.notify();
       })
@@ -508,7 +508,15 @@ export class Island {
   // ── Geometry ────────────────────────────────────────────────────────────────
 
   private targetSize(): { w: number; h: number; r: number } {
-    const { w, h } = islandSize(State.mode, State.view, State.chatHistory.length);
+    const size = islandSize(State.mode, State.view, State.chatHistory.length);
+    // Docked to a side, hidden means tucked into that edge rather than the top.
+    if (State.mode === "hidden" && State.settings.dock !== "top") {
+      size.w = 0;
+      size.h = NOTCH_H;
+    }
+    const { w } = size;
+    // An enlarged picture gets all the height the window has.
+    const h = State.mode === "expanded" && State.view === "prompt" && State.imageOpen ? Math.max(size.h, 300) : size.h;
     const r = State.mode === "expanded" ? EXPANDED_CORNER : ROUNDED_CORNER;
     return { w, h, r };
   }
@@ -533,8 +541,17 @@ export class Island {
     const r = this.radius.value;
     this.islandEl.style.width = `${w}px`;
     this.islandEl.style.height = `${hh}px`;
-    this.islandEl.style.borderRadius = `0 0 ${r}px ${r}px`;
-    this.islandEl.style.transform = `translateX(-50%)`;
+    // Glued to the edge it is docked to; the far corners rounded.
+    const dock = State.settings.dock;
+    const st = this.islandEl.style;
+    if (dock === "left") {
+      Object.assign(st, { left: "0", right: "auto", top: "50%", transform: "translateY(-50%)", borderRadius: `0 ${r}px ${r}px 0` });
+    } else if (dock === "right") {
+      Object.assign(st, { left: "auto", right: "0", top: "50%", transform: "translateY(-50%)", borderRadius: `${r}px 0 0 ${r}px` });
+    } else {
+      Object.assign(st, { left: "50%", right: "auto", top: "0", transform: "translateX(-50%)", borderRadius: `0 0 ${r}px ${r}px` });
+    }
+    document.documentElement.dataset.dock = dock;
     // These follow the island as it resizes, so they belong here rather than in
     // the state-driven DOM sync.
     this.miniGrid.style.left = `${w - 40 - 14.5}px`;
@@ -542,9 +559,12 @@ export class Island {
     this.greetingCanvas.style.left = `${(w - EXPANDED_W) / 2}px`;
     this.uploadCanvas.el.style.left = `${(w - EXPANDED_W) / 2}px`;
 
-    const rect = { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    const rect = this.islandRect();
     const p = this.pushedRect;
-    if (Math.abs(p.x - rect.x) > 0.5 || Math.abs(p.w - rect.w) > 0.5 || Math.abs(p.h - rect.h) > 0.5) {
+    if (
+      Math.abs(p.x - rect.x) > 0.5 || Math.abs(p.y - rect.y) > 0.5 ||
+      Math.abs(p.w - rect.w) > 0.5 || Math.abs(p.h - rect.h) > 0.5
+    ) {
       this.pushedRect = rect;
       void Bridge.setIslandRect(rect.x, rect.y, rect.w, rect.h);
     }
@@ -554,7 +574,14 @@ export class Island {
   private islandRect(): { x: number; y: number; w: number; h: number } {
     const w = this.width.value;
     const hh = this.height.value;
-    return { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    switch (State.settings.dock) {
+      case "left":
+        return { x: 0, y: (PANEL_H - hh) / 2, w, h: hh };
+      case "right":
+        return { x: PANEL_W - w, y: (PANEL_H - hh) / 2, w, h: hh };
+      default:
+        return { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    }
   }
 
   // ── Window collapse (hidden → tiny wake strip, zero polling) ────────────────
@@ -589,11 +616,35 @@ export class Island {
       if (State.mode === "hidden") this.fsm.mouseEntered();
     });
 
+    // Dragging the island moves it to another edge or screen. A press that
+    // travels a few pixels hands the window to the window manager; one that
+    // does not is an ordinary click. Text, fields and buttons are left alone.
+    let press: { x: number; y: number; compact: boolean } | null = null;
+    const draggable = (target: EventTarget | null) =>
+      !(target instanceof Element) ||
+      !target.closest("button, input, textarea, select, a, .chat-log, .work-body, .lightbox, .mode-menu, .chip");
+    this.islandEl.addEventListener("mousedown", (e) => {
+      if (e.button === 0 && draggable(e.target)) press = { x: e.screenX, y: e.screenY, compact: State.mode !== "expanded" };
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!press || (e.buttons & 1) === 0) return;
+      if (Math.hypot(e.screenX - press.x, e.screenY - press.y) < 6) return;
+      press = null;
+      void Bridge.startDrag();
+    });
+    window.addEventListener("mouseup", (e) => {
+      const p = press;
+      press = null;
+      // A compact island opens on a click, not on the press a drag starts with.
+      if (p?.compact && Math.hypot(e.screenX - p.x, e.screenY - p.y) < 6) this.fsm.click();
+    });
+
     this.islandEl.addEventListener("mousedown", (e) => {
       Sound.resume();
       State.lastActivity = performance.now();
       if (State.mode !== "expanded") {
-        this.fsm.click();
+        // Opens on mouseup instead (above), unless this press becomes a drag.
+        if (!draggable(e.target)) this.fsm.click();
         return;
       }
       if (this.isBotHit(e.clientX, e.clientY)) {
@@ -969,6 +1020,8 @@ export class Island {
 
   /** Applies settings coming from Rust at boot. */
   applySettings() {
+    // A new dock (after a drag) lays the island out against that edge.
+    this.animateGeometry(false);
     Sound.setEnabled(State.settings.soundEnabled);
     Sound.setVolume(State.settings.soundVolume);
     this.fsm.homeToPetitDelay = State.settings.autoCloseInterval;
