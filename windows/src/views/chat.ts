@@ -64,11 +64,18 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
   let sending = false;
   let renderedKey = "";
 
+  /** Typing, a half-written question, or an answer on its way: keep the island open. */
+  function updateEngaged() {
+    State.chatEngaged = sending || input.value.trim() !== "" || document.activeElement === input;
+  }
+  for (const event of ["input", "focus", "blur"]) input.addEventListener(event, updateEngaged);
+
   async function submit() {
     const query = input.value.trim();
     if (!query || sending) return;
     input.value = "";
     sending = true;
+    updateEngaged();
     Sound.play("send");
 
     State.chatHistory.push({ id: nextId++, role: "user", content: query });
@@ -78,7 +85,9 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
 
     const file = State.droppedFile;
     const context: ChatContext | null =
-      State.chatHistory.length === 1 && file ? { kind: "file", name: file.name, path: file.path } : null;
+      State.chatHistory.length === 1 && file
+        ? { kind: "file", name: file.name, path: file.path, original: file.original }
+        : null;
 
     // The conversation may be cleared while the answer is on its way (the
     // island hid): it then belongs to nothing on screen.
@@ -88,6 +97,8 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
       const reply = await Bridge.chatSend(query, context);
       State.stateOverride = null;
       if (State.chatHistory === conversation) {
+        // However long the wait, the answer gets a full close delay to be read.
+        State.chatReadUntil = performance.now() + State.settings.autoCloseInterval * 1000;
         State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text });
         Sound.play("finish");
       }
@@ -101,6 +112,7 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     } finally {
       State.toolActivity = null;
       sending = false;
+      updateEngaged();
       State.notify();
       onHeightChange();
       input.focus();

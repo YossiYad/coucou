@@ -12,17 +12,20 @@ pub fn spreadsheet(path: &str) -> Option<String> {
     let mut out = String::new();
     for name in workbook.sheet_names().to_owned() {
         let Ok(range) = workbook.worksheet_range(&name) else { continue };
-        out.push_str(&format!("Sheet: {name}\n"));
-        for row in range.rows() {
-            let mut cells: Vec<String> = row.iter().map(cell_text).collect();
+        // Real row numbers, and cells at their column's position from A, so a
+        // model can point at "row 7" or "C5" to change them.
+        let (first_row, first_col) = range.start().unwrap_or((0, 0));
+        out.push_str(&format!("Sheet: {name} (cells are tab-separated, the first one in a row is column A)\n"));
+        for (i, row) in range.rows().enumerate() {
+            let mut cells: Vec<String> = vec![String::new(); first_col as usize];
+            cells.extend(row.iter().map(cell_text));
             while cells.last().is_some_and(|c| c.is_empty()) {
                 cells.pop();
             }
-            if cells.is_empty() {
+            if cells.iter().all(|c| c.is_empty()) {
                 continue;
             }
-            out.push_str(&cells.join("\t"));
-            out.push('\n');
+            out.push_str(&format!("[row {}] {}\n", first_row as usize + i + 1, cells.join("\t")));
         }
         out.push('\n');
     }
@@ -206,7 +209,6 @@ pub fn clip(text: &str, max_chars: usize) -> String {
 /// Writes tab-separated rows as a spreadsheet, the same shape `spreadsheet`
 /// reads: a line "Sheet: name" starts a sheet, numbers stay numbers.
 pub fn write_xlsx(path: &std::path::Path, content: &str) -> Result<(), String> {
-    let mut book = rust_xlsxwriter::Workbook::new();
     let mut sheets: Vec<(String, Vec<&str>)> = Vec::new();
     for line in content.lines() {
         match line.strip_prefix("Sheet:") {
@@ -219,6 +221,21 @@ pub fn write_xlsx(path: &std::path::Path, content: &str) -> Result<(), String> {
             }
         }
     }
+    let sheets: Vec<(String, Vec<Vec<String>>)> = sheets
+        .into_iter()
+        .map(|(name, rows)| (name, rows.iter().map(|r| r.split('\t').map(str::to_string).collect()).collect()))
+        .collect();
+    save_sheets(path, &sheets)
+}
+
+/// One sheet from rows of cells, as the create_file tool receives them.
+pub fn write_rows_xlsx(path: &std::path::Path, sheet: &str, rows: &[Vec<String>]) -> Result<(), String> {
+    let name = if sheet.trim().is_empty() { "Sheet1" } else { sheet.trim() };
+    save_sheets(path, &[(name.to_string(), rows.to_vec())])
+}
+
+fn save_sheets(path: &std::path::Path, sheets: &[(String, Vec<Vec<String>>)]) -> Result<(), String> {
+    let mut book = rust_xlsxwriter::Workbook::new();
     for (name, rows) in sheets {
         let sheet = book.add_worksheet();
         if !name.is_empty() {
@@ -227,7 +244,7 @@ pub fn write_xlsx(path: &std::path::Path, content: &str) -> Result<(), String> {
             let _ = sheet.set_name(safe);
         }
         for (r, row) in rows.iter().enumerate() {
-            for (c, cell) in row.split('\t').enumerate() {
+            for (c, cell) in row.iter().enumerate() {
                 let (r, c) = (r as u32, c as u16);
                 let cell = cell.trim();
                 if cell.is_empty() {
@@ -244,6 +261,160 @@ pub fn write_xlsx(path: &std::path::Path, content: &str) -> Result<(), String> {
         }
     }
     book.save(path).map_err(|e| format!("Could not save the spreadsheet: {e}"))
+}
+
+/// Deletes a row without breaking formulas. The spreadsheet library shifts both
+/// ends of every range up, so deleting the first row of SUM(F4:F33) gave
+/// SUM(F3:F32): a total that silently takes in the row above. A range that
+/// starts on the deleted row is made to start below it first, and the shift
+/// then lands it where Excel would.
+pub fn remove_row_keeping_formulas(sheet: &mut umya_spreadsheet::Worksheet, row: u32) {
+    let fixes: Vec<((u32, u32), String)> = sheet
+        .cells()
+        .into_iter()
+        .filter(|c| c.is_formula())
+        .filter_map(|c| {
+            let fixed = start_ranges_below(c.formula(), row);
+            (fixed != c.formula()).then(|| ((c.coordinate().col_num(), c.coordinate().row_num()), fixed))
+        })
+        .collect();
+    for (at, formula) in fixes {
+        sheet.cell_mut(at).set_formula(formula);
+    }
+    sheet.remove_row(row, 1);
+}
+
+/// In ranges like F4:F33 whose first row is `row`, starts them a row lower.
+/// Text in quotes is left alone.
+fn start_ranges_below(formula: &str, row: u32) -> String {
+    let chars: Vec<char> = formula.chars().collect();
+    let mut out = String::with_capacity(formula.len());
+    let mut i = 0;
+    let mut quoted = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            quoted = !quoted;
+        }
+        if !quoted && c == ':' {
+            // The digits just before ':' are the range's first row.
+            let digits_end = out.len();
+            let digits_start = out.trim_end_matches(|d: char| d.is_ascii_digit()).len();
+            let before = &out[..digits_start];
+            let has_column = before.trim_end_matches('$').ends_with(|l: char| l.is_ascii_alphabetic());
+            let first: Option<u32> = out[digits_start..digits_end].parse().ok();
+            // And the range must end below it.
+            let rest: String = chars[i + 1..].iter().collect();
+            let after_col = rest.trim_start_matches('$').trim_start_matches(|l: char| l.is_ascii_alphabetic());
+            let after_col = after_col.trim_start_matches('$');
+            let end_digits: String = after_col.chars().take_while(|d| d.is_ascii_digit()).collect();
+            let last: Option<u32> = end_digits.parse().ok();
+            if has_column && first == Some(row) && last.is_some_and(|l| l > row) {
+                out.truncate(digits_start);
+                out.push_str(&(row + 1).to_string());
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// The XML part of each sheet, in workbook order (workbook.xml + its rels).
+fn sheet_parts(read: &mut dyn FnMut(&str) -> Option<String>) -> Vec<String> {
+    let (Some(book), Some(rels)) = (read("xl/workbook.xml"), read("xl/_rels/workbook.xml.rels")) else {
+        return Vec::new();
+    };
+    let targets: std::collections::HashMap<String, String> = rels
+        .split("<Relationship ")
+        .skip(1)
+        .filter_map(|rel| {
+            let tag = rel.split('>').next()?;
+            let id = attribute(&format!("x {tag}"), "Id")?;
+            let target = attribute(&format!("x {tag}"), "Target")?;
+            let path = match target.strip_prefix('/') {
+                Some(abs) => abs.to_string(),
+                None => format!("xl/{target}"),
+            };
+            Some((id, path))
+        })
+        .collect();
+    book.split("<sheet ")
+        .skip(1)
+        .filter_map(|s| {
+            let tag = s.split('>').next()?;
+            targets.get(&attribute(&format!("x {tag}"), "r:id")?).cloned()
+        })
+        .collect()
+}
+
+fn zip_text(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> {
+    let mut text = String::new();
+    archive.by_name(name).ok()?.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// Puts back what the spreadsheet library drops when it saves: a sheet's
+/// right-to-left direction, and stale formula results. It writes no
+/// `rightToLeft`, and keeps the old cached values, so a total would still show
+/// a deleted row; fullCalcOnLoad makes Excel and LibreOffice recompute.
+pub fn repair_saved_xlsx(original: &std::path::Path, saved: &std::path::Path) -> Result<(), String> {
+    let rtl: Vec<bool> = {
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(original).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let parts = sheet_parts(&mut |n| zip_text(&mut archive, n));
+        parts
+            .iter()
+            .map(|p| {
+                zip_text(&mut archive, p).is_some_and(|xml| {
+                    xml.split("<sheetView ").nth(1).and_then(|t| t.split('>').next()).is_some_and(|tag| {
+                        tag.contains("rightToLeft=\"1\"") || tag.contains("rightToLeft=\"true\"")
+                    })
+                })
+            })
+            .collect()
+    };
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(saved).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let parts = sheet_parts(&mut |n| zip_text(&mut archive, n));
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        entries.push((file.name().to_string(), bytes));
+    }
+    drop(archive);
+
+    for (name, bytes) in entries.iter_mut() {
+        if name == "xl/workbook.xml" {
+            let xml = String::from_utf8_lossy(bytes).to_string();
+            if !xml.contains("fullCalcOnLoad") {
+                *bytes = xml.replacen("<calcPr ", "<calcPr fullCalcOnLoad=\"1\" ", 1).into_bytes();
+            }
+        } else if let Some(index) = parts.iter().position(|p| p == name) {
+            if rtl.get(index).copied().unwrap_or(false) {
+                let xml = String::from_utf8_lossy(bytes).to_string();
+                if !xml.contains("rightToLeft=") {
+                    *bytes = xml.replacen("<sheetView ", "<sheetView rightToLeft=\"1\" ", 1).into_bytes();
+                }
+            }
+        }
+    }
+
+    let temp = saved.with_extension("xlsx.coucou-tmp");
+    {
+        let file = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in &entries {
+            writer.start_file(name.as_str(), options).map_err(|e| e.to_string())?;
+            std::io::Write::write_all(&mut writer, bytes).map_err(|e| e.to_string())?;
+        }
+        writer.finish().map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&temp, saved).map_err(|e| e.to_string())
 }
 
 pub struct WebPage {
@@ -327,7 +498,7 @@ fn between<'a>(text: &'a str, lower: &str, start: &str, end: &str) -> Option<&'a
 
 fn attribute(tag: &str, name: &str) -> Option<String> {
     let lower = tag.to_lowercase();
-    let at = lower.find(&format!("{name}="))? + name.len() + 1;
+    let at = lower.find(&format!("{}=", name.to_lowercase()))? + name.len() + 1;
     let rest = &tag[at..];
     let value = match rest.chars().next()? {
         q @ ('"' | '\'') => rest[1..].split(q).next()?,
@@ -454,7 +625,45 @@ mod tests {
         write_xlsx(&path, "Sheet: מנויים\nשירות\tמחיר\nנטפליקס\t49.9\nקוד\t007").unwrap();
         let back = spreadsheet(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(back, "Sheet: מנויים\nשירות\tמחיר\nנטפליקס\t49.9\nקוד\t007");
+        assert_eq!(back, "Sheet: מנויים (cells are tab-separated, the first one in a row is column A)\n[row 1] שירות\tמחיר\n[row 2] נטפליקס\t49.9\n[row 3] קוד\t007");
+    }
+
+    #[test]
+    fn an_edited_spreadsheet_keeps_right_to_left_and_recomputes_formulas() {
+        let dir = std::env::temp_dir().join(format!("coucou-rtl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("in.xlsx");
+        let saved = dir.join("out.xlsx");
+        {
+            let mut book = rust_xlsxwriter::Workbook::new();
+            let sheet = book.add_worksheet();
+            sheet.set_right_to_left(true);
+            sheet.write_number(0, 0, 10).unwrap();
+            sheet.write_number(1, 0, 20).unwrap();
+            sheet.write_formula(2, 0, "=SUM(A1:A2)").unwrap();
+            book.save(&original).unwrap();
+        }
+        let mut book = umya_spreadsheet::reader::xlsx::read(&original).unwrap();
+        remove_row_keeping_formulas(book.sheet_mut(0).unwrap(), 1);
+        umya_spreadsheet::writer::xlsx::write(&book, &saved).unwrap();
+        repair_saved_xlsx(&original, &saved).unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&saved).unwrap()).unwrap();
+        let sheet = zip_text(&mut archive, "xl/worksheets/sheet1.xml").unwrap();
+        let workbook = zip_text(&mut archive, "xl/workbook.xml").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(sheet.contains("rightToLeft=\"1\""), "direction lost");
+        assert!(workbook.contains("fullCalcOnLoad=\"1\""), "no recalculation on load");
+        assert!(sheet.contains("SUM(A1:A1)"), "formula not shifted: {sheet}");
+    }
+
+    #[test]
+    fn ranges_starting_on_a_deleted_row_start_below_it() {
+        assert_eq!(start_ranges_below("SUM(F4:F33)", 4), "SUM(F5:F33)");
+        assert_eq!(start_ranges_below("SUM($F$4:$F$33)", 4), "SUM($F$5:$F$33)");
+        assert_eq!(start_ranges_below("SUM(F4:F33)", 7), "SUM(F4:F33)");
+        assert_eq!(start_ranges_below("SUM(F4:F4)", 4), "SUM(F4:F4)");
+        assert_eq!(start_ranges_below("IF(C4=\"4:5\",SUM(A4:A9),0)", 4), "IF(C4=\"4:5\",SUM(A5:A9),0)");
     }
 
     #[test]
@@ -463,4 +672,6 @@ mod tests {
         assert!(clip("אבגד", 2).starts_with("אב\n[... cut here"));
     }
 }
+
+
 

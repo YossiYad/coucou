@@ -177,6 +177,7 @@ mod tests {
             text: "describe".into(),
             file: Some(ai::FileNote {
                 name: "cat.png".into(),
+                origin: None,
                 content: Some(Attachment::Image { media: "image/png", data: vec![1, 2, 3] }),
             }),
             window: None,

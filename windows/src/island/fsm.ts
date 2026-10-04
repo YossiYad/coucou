@@ -18,6 +18,8 @@ export class IslandStateMachine {
   greetHoverCollapseDelay = 10;
   /** An alert waiting for an answer stays open, even when the mouse leaves. */
   pinned = false;
+  /** Checked when the open island is about to close on its own. */
+  holdOpen: () => boolean = () => false;
 
   private petitHide: number | null = null;
   private homeCollapse: number | null = null;
@@ -117,7 +119,14 @@ export class IslandStateMachine {
     if (this.pinned) return;
     this.homeCollapse = window.setTimeout(() => {
       this.homeCollapse = null;
-      if (this.state === "home") this.transition("petit");
+      if (this.state !== "home") return;
+      // Someone typing, or waiting for an answer, may well have the mouse
+      // elsewhere: look again a full delay later instead of closing on them.
+      if (this.holdOpen()) {
+        this.scheduleHomeCollapse();
+        return;
+      }
+      this.transition("petit");
     }, this.homeToPetitDelay * 1000);
   }
 

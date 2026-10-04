@@ -88,6 +88,8 @@ pub async fn complete<R: Runtime>(app: &AppHandle<R>, settings: &Settings, histo
         "model": model,
         "messages": messages,
         "stream": false,
+        // Qwen3 otherwise thinks for minutes and can loop until the server aborts.
+        "reasoning_effort": "none",
     });
     let request = ai::client(TIMEOUT_SECS)?
         .post(format!("{base}/chat/completions"))
@@ -116,12 +118,35 @@ async fn agent<R: Runtime>(
     let mut used: Vec<String> = Vec::new();
 
     for _ in 0..MAX_STEPS {
-        let body = json!({ "model": model, "messages": messages, "tools": definitions, "stream": false });
-        let request = ai::client(TIMEOUT_SECS)?.post(format!("{base}/chat/completions")).json(&body);
-        let response = match ai::send_json(request).await {
-            Err(e) if e.message.contains("does not support tools") => return Ok(None),
-            Err(e) => return Err(describe(&e, base, settings)),
-            Ok(v) => v,
+        // Qwen3 sometimes writes a tool call the server cannot parse, and the
+        // reply comes back empty. Sampling again usually fixes it; thinking is
+        // the last resort, since it tends to garble the data it passes on. A low
+        // temperature keeps tool calls well formed. Thinking can loop until the
+        // server aborts it, and then the fast way is tried again.
+        let mut attempt = 0;
+        let response = loop {
+            attempt += 1;
+            let thinking = attempt == 3;
+            let body = json!({
+                "model": model,
+                "messages": messages,
+                "tools": definitions,
+                "stream": false,
+                "temperature": 0.3,
+                "reasoning_effort": if thinking { "low" } else { "none" },
+            });
+            let request = ai::client(TIMEOUT_SECS)?.post(format!("{base}/chat/completions")).json(&body);
+            match ai::send_json(request).await {
+                Err(e) if e.message.contains("does not support tools") => return Ok(None),
+                Err(e) if e.message.contains("repeat limit") && attempt < 4 => {
+                    crate::log::line("agent: the model looped, asking again");
+                }
+                Err(e) => return Err(describe(&e, base, settings)),
+                Ok(v) if is_empty_reply(&v) && attempt < 3 => {
+                    crate::log::line(format!("agent: empty reply, asking again ({})", if attempt == 2 { "with thinking" } else { "again" }));
+                }
+                Ok(v) => break v,
+            }
         };
         local_server::touch();
 
@@ -132,7 +157,9 @@ async fn agent<R: Runtime>(
         let calls = message.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
         if calls.is_empty() {
             let mut answer = parse(&response)?;
-            if !used.is_empty() {
+            if used.is_empty() {
+                crate::log::line("agent: answered without using tools");
+            } else {
                 // The next turn needs to know what was done, not the bulk of it.
                 answer.stored = json!({
                     "role": "assistant",
@@ -156,6 +183,8 @@ async fn agent<R: Runtime>(
                 None => json!({}),
             };
             let result = tools::run(app, name, &args).await;
+            let outcome = if result.starts_with("Error:") { result.as_str() } else { "ok" };
+            crate::log::line(format!("tool: {name} {} -> {outcome}", summary(&args)));
             local_server::touch();
             used.push(format!("{name} {}", summary(&args)));
             let mut reply = json!({ "role": "tool", "name": name, "content": result });
@@ -168,6 +197,14 @@ async fn agent<R: Runtime>(
     Err("That took too many steps. Try asking for something narrower.".into())
 }
 
+/// No text and no tool call: what is left of a tool call the server could not parse.
+fn is_empty_reply(response: &Value) -> bool {
+    let message = response.pointer("/choices/0/message");
+    let text = message.and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("");
+    let calls = message.and_then(|m| m.get("tool_calls")).and_then(Value::as_array).is_some_and(|c| !c.is_empty());
+    strip_thinking(text).trim().is_empty() && !calls
+}
+
 fn agent_prompt() -> String {
     let (y, mo, d, ..) = crate::clock::local_now();
     let home = std::env::var("HOME").unwrap_or_default();
@@ -175,7 +212,9 @@ fn agent_prompt() -> String {
         "{}\n\nYou can act on the user's computer with tools: find files, list folders, read files (long ones part by part, \
 PDFs page by page), create and edit files (the user approves every change), read web pages and follow their links, \
 search the web, and open files or links for the user. Use them whenever the answer depends on the user's files or on \
-current information, instead of guessing or saying you can't. The user's home folder is {home}; their desktop is \
+current information, instead of guessing or saying you can't. When the user asks you to do something (create, change, \
+find, open, look up), do it with the tools rather than explaining how, then say briefly what you did. A file the user \
+dropped comes with the place it was dropped from: read or change it there. The user's home folder is {home}; their desktop is \
 {home}/Desktop and their documents are in {home}/Documents. Today is {y:04}-{mo:02}-{d:02}. Read only as much of a \
 long file as the question needs.",
         ai::system_prompt(false)
@@ -287,7 +326,7 @@ mod tests {
 
         let pdf = UserTurn {
             text: "read".into(),
-            file: Some(ai::FileNote { name: "a.pdf".into(), content: Some(Attachment::Pdf(vec![])) }),
+            file: Some(ai::FileNote { name: "a.pdf".into(), origin: None, content: Some(Attachment::Pdf(vec![])) }),
             window: None,
         };
         assert!(user_message(&pdf).is_err());
@@ -299,6 +338,7 @@ mod tests {
             text: "what is it".into(),
             file: Some(ai::FileNote {
                 name: "x.jpg".into(),
+                origin: None,
                 content: Some(Attachment::Image { media: "image/jpeg", data: vec![9] }),
             }),
             window: None,
@@ -308,3 +348,4 @@ mod tests {
         assert_eq!(content[2]["text"], "what is it");
     }
 }
+

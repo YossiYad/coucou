@@ -125,7 +125,7 @@ mod tests {
     fn a_pdf_rides_along_as_a_document_before_the_question() {
         let turn = UserTurn {
             text: "summarise".into(),
-            file: Some(FileNote { name: "a.pdf".into(), content: Some(Attachment::Pdf(b"%PDF".to_vec())) }),
+            file: Some(FileNote { name: "a.pdf".into(), origin: None, content: Some(Attachment::Pdf(b"%PDF".to_vec())) }),
             window: None,
         };
         let message = user_message(&turn);

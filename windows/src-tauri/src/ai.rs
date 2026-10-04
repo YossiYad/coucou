@@ -113,7 +113,14 @@ impl Chat {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ChatContext {
-    File { name: String, path: String },
+    File {
+        name: String,
+        /// The copy in Coucou's inbox, which is what gets read.
+        path: String,
+        /// Where the user dropped it from, so a model with tools can work on it.
+        #[serde(default)]
+        original: Option<String>,
+    },
     Window { app_name: String, title: String, url: Option<String> },
 }
 
@@ -140,14 +147,17 @@ pub struct FileNote {
     pub name: String,
     /// None when the file could not be read or is too large to inline.
     pub content: Option<Attachment>,
+    /// Where it came from, told to models that can act on files.
+    pub origin: Option<String>,
 }
 
 impl FileNote {
     /// "File: name", with a warning when its contents never made it, so the
     /// model says so instead of inventing them.
     pub fn label(&self) -> String {
+        let origin = self.origin.as_ref().map(|o| format!(" (dropped from {o})")).unwrap_or_default();
         match self.content {
-            Some(_) => format!("File: {}", self.name),
+            Some(_) => format!("File: {}{origin}", self.name),
             None => format!(
                 "File: {} (Coucou could not read this file's contents. Tell the user so; do not guess what is in it.)",
                 self.name
@@ -165,11 +175,12 @@ pub struct UserTurn {
 }
 
 impl UserTurn {
-    fn new(text: String, context: Option<ChatContext>) -> Self {
+    fn new(text: String, context: Option<ChatContext>, with_origin: bool) -> Self {
         let mut turn = Self { text, file: None, window: None };
         match context {
-            Some(ChatContext::File { name, path }) => {
-                turn.file = Some(FileNote { name, content: read_attachment(&path) });
+            Some(ChatContext::File { name, path, original }) => {
+                let origin = original.filter(|_| with_origin).map(|o| home_relative(&o));
+                turn.file = Some(FileNote { name, content: read_attachment(&path), origin });
             }
             Some(ChatContext::Window { app_name, title, url }) => {
                 let mut note = format!("Context -App: {app_name}, Window: {title}");
@@ -206,34 +217,42 @@ pub async fn send<R: tauri::Runtime>(
         None => "(Reply in the same language I used in this message.)".to_string(),
     };
     let text = format!("{query}\n\n{hint}");
-    let turn = UserTurn::new(text, if chat.is_empty() { context } else { None });
+    let acts = provider == Provider::Local && settings.tools_enabled;
+    let turn = UserTurn::new(text, if chat.is_empty() { context } else { None }, acts);
 
+    // What was asked of whom, never the words themselves.
+    let file = turn.file.as_ref().map(|f| format!(", file {}", f.name)).unwrap_or_default();
+    crate::log::line(format!("chat: asking {provider:?}{file}"));
     let user = match provider {
         Provider::Anthropic => claude::user_message(&turn),
         Provider::OpenAi => openai::user_message(&turn),
         Provider::Gemini => gemini::user_message(&turn),
-        Provider::Local => local_llm::user_message(&turn)?,
+        Provider::Local => local_llm::user_message(&turn).inspect_err(|e| crate::log::line(format!("chat: refused: {e}")))?,
     };
     chat.push(user);
     let history = chat.snapshot();
     let epoch = chat.epoch();
 
+    let started = std::time::Instant::now();
     let result = match provider {
         Provider::Anthropic => claude::complete(&settings.model, &history).await,
         Provider::OpenAi => openai::complete(&settings.openai_model, &history).await,
         Provider::Gemini => gemini::complete(&settings.gemini_model, &history).await,
         Provider::Local => local_llm::complete(app, settings, &history).await,
     };
+    let secs = started.elapsed().as_secs_f32();
     // Cleared while the model was answering: the question is gone already.
     let current = chat.epoch() == epoch;
     match result {
         Ok(answer) => {
+            crate::log::line(format!("chat: answered in {secs:.0}s ({} chars)", answer.text.chars().count()));
             if current {
                 chat.push(answer.stored);
             }
             Ok(ChatReply { text: plain_text(&answer.text) })
         }
         Err(err) => {
+            crate::log::line(format!("chat: failed after {secs:.0}s: {err}"));
             if current {
                 chat.pop(); // keep the history consistent with what the model saw
             }
@@ -298,6 +317,14 @@ fn detect_language(text: &str) -> Option<&'static str> {
     // Below this, guesses on short texts were mostly wrong ("Merci" as
     // Indonesian, "ok" as Hungarian), so a short message names nothing.
     by_script.or_else(|| (info.confidence() >= 0.25).then(|| info.lang().eng_name()))
+}
+
+/// `/home/me/Desktop/a.xlsx` as `~/Desktop/a.xlsx`, the form the tools take.
+fn home_relative(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&format!("{home}/")) => format!("~{}", &path[home.len()..]),
+        _ => path.to_string(),
+    }
 }
 
 pub fn require_model(model: &str) -> Result<&str, String> {
@@ -494,10 +521,21 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_file_tells_an_acting_model_where_it_came_from() {
+        let home = std::env::var("HOME").unwrap();
+        let note = FileNote { name: "a.xlsx".into(), content: Some(Attachment::Text("x".into())), origin: Some(home_relative(&format!("{home}/Desktop/a.xlsx"))) };
+        assert_eq!(note.label(), "File: a.xlsx (dropped from ~/Desktop/a.xlsx)");
+        assert_eq!(home_relative("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
     fn unknown_providers_fall_back_to_claude() {
         assert_eq!(Provider::parse("openai"), Provider::OpenAi);
         assert_eq!(Provider::parse(""), Provider::Anthropic);
         assert_eq!(Provider::parse("something-new"), Provider::Anthropic);
     }
 }
+
+
+
 

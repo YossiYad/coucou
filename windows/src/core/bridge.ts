@@ -113,7 +113,7 @@ export interface IntegrationUpdate {
 }
 
 export type ChatContext =
-  | { kind: "file"; name: string; path: string }
+  | { kind: "file"; name: string; path: string; original?: string }
   | { kind: "window"; appName: string; title: string; url?: string };
 
 export interface ModelInfo {

@@ -179,7 +179,8 @@ class AppState {
   fileDragOver = false;
 
   promptContext: PromptContext | null = null;
-  droppedFile: { name: string; path: string } | null = null;
+  /** `path` is the inbox copy; `original` where it was dropped from. */
+  droppedFile: { name: string; path: string; original?: string } | null = null;
   noteMessage: string | null = null;
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
@@ -188,6 +189,10 @@ class AppState {
   toolApproval: ToolApproval | null = null;
   /** What the chat model is doing right now: "Reading report.pdf…". */
   toolActivity: string | null = null;
+  /** The user is typing in the chat, or waiting for its answer. */
+  chatEngaged = false;
+  /** An answer just arrived: give it time to be read before closing (performance.now()). */
+  chatReadUntil = 0;
 
   integrations: Record<string, IntegrationInfo> = {};
 

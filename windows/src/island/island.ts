@@ -101,6 +101,10 @@ export class Island {
     this.build();
     this.wireFsm();
     this.wireInput();
+    // Mid-conversation, or a dropped file still waiting for a decision.
+    this.fsm.holdOpen = () =>
+      UPLOAD_VIEWS.has(State.view) ||
+      (State.view === "prompt" && (State.chatEngaged || performance.now() < State.chatReadUntil));
     this.engine.onDizzy = () => this.handleDizzy();
     this.greeting.onComplete = () => this.fsm.greetComplete();
     State.subscribe(() => {
@@ -267,6 +271,7 @@ export class Island {
   private setMode(mode: IslandMode) {
     const prev = State.mode;
     if (mode === prev) return;
+    void Bridge.log(`island ${prev} -> ${mode} (view ${State.view})`);
     State.mode = mode;
     if (mode === "expanded") Sound.play("open");
     if (prev === "expanded") {
@@ -303,6 +308,7 @@ export class Island {
   }
 
   expand(view: IslandViewName) {
+    if (view !== State.view) void Bridge.log(`view ${view}`);
     this.stopSequenceIfLeaving(view);
     State.view = view;
     if (State.mode !== "expanded") this.setMode("expanded");
@@ -313,6 +319,7 @@ export class Island {
   }
 
   setView(view: IslandViewName) {
+    if (view !== State.view) void Bridge.log(`view ${view}`);
     this.stopSequenceIfLeaving(view);
     if (State.mode !== "expanded") {
       this.fsm.forceHome();
@@ -436,7 +443,7 @@ export class Island {
    */
   private swallow(path: string) {
     const name = path.split(/[\\/]/).pop() || "file";
-    State.droppedFile = { name, path };
+    State.droppedFile = { name, path, original: path };
     State.promptContext = { kind: "file", name, path };
     State.chatHistory = [];
     void Bridge.chatReset();
@@ -456,11 +463,12 @@ export class Island {
 
     void Bridge.ingestFile(path)
       .then((file) => {
-        State.droppedFile = { name: file.name, path: file.path };
+        State.droppedFile = { name: file.name, path: file.path, original: path };
         State.promptContext = { kind: "file", name: file.name, path: file.path };
         State.notify();
       })
       .catch((err) => {
+        void Bridge.log(`file not taken: ${String(err)}`);
         UploadSeq.deactivate();
         State.noteMessage = String(err).replace(/^Error:\s*/, "");
         this.engine.animateMorph(0);
@@ -898,7 +906,7 @@ export class Island {
   }
 
   private updateCountdown(nowMs: number) {
-    if (State.mode !== "expanded" || State.isPinned || this.homeCollapseAt == null) {
+    if (State.mode !== "expanded" || State.isPinned || State.chatEngaged || this.homeCollapseAt == null) {
       this.countdown.style.width = "0px";
       return;
     }

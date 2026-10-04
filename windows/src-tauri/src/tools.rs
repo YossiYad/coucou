@@ -59,14 +59,46 @@ pub fn definitions() -> Value {
             }),
             &["path"]),
         tool("create_file",
-            "Create a file, or replace one with overwrite. For .xlsx write tab-separated rows, one row per line; a line \
-\"Sheet: name\" starts a sheet. The user must approve before anything is written.",
+            "Create a file, or replace one with overwrite. A spreadsheet (.xlsx or .csv) takes rows: a list of rows, each a \
+list of cell values. Any other file takes lines: a list of text lines. The user must approve before anything is written.",
             json!({
                 "path": { "type": "string", "description": "Where to save it, like ~/Desktop/notes.txt" },
-                "content": { "type": "string", "description": "The full content" },
+                "rows": {
+                    "type": "array",
+                    "description": "For spreadsheets: the rows, the first usually being the column titles",
+                    "items": { "type": "array", "items": { "type": "string" } },
+                },
+                "lines": { "type": "array", "description": "For text files: the lines", "items": { "type": "string" } },
+                "sheet": { "type": "string", "description": "Optional name for the spreadsheet's sheet" },
                 "overwrite": { "type": "boolean", "description": "Replace an existing file (a backup copy is kept)" },
             }),
-            &["path", "content"]),
+            &["path"]),
+        tool("edit_spreadsheet",
+            "Change an existing spreadsheet (.xlsx) in place, keeping all its formatting: delete rows and set cell \
+values. Use the row numbers and column letters read_file shows. Never rewrite a spreadsheet with create_file. The user \
+must approve.",
+            json!({
+                "path": { "type": "string" },
+                "sheet": { "type": "string", "description": "Sheet name; the first sheet if left out" },
+                "delete_rows": {
+                    "type": "array",
+                    "description": "Row numbers to delete, as read_file shows them",
+                    "items": { "type": "integer" },
+                },
+                "set_cells": {
+                    "type": "array",
+                    "description": "Cells to fill or change",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "cell": { "type": "string", "description": "Like C5" },
+                            "value": { "type": "string" },
+                        },
+                        "required": ["cell", "value"],
+                    },
+                },
+            }),
+            &["path"]),
         tool("edit_file",
             "Change part of a text file by replacing an exact piece of text. The user must approve the change.",
             json!({
@@ -113,8 +145,9 @@ pub async fn run<R: Runtime>(app: &AppHandle<R>, name: &str, args: &Value) -> St
         }
         "create_file" => {
             let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
-            create_file(app, &arg("path"), args.get("content").and_then(Value::as_str).unwrap_or(""), overwrite).await
+            create_file(app, &arg("path"), file_body(args), &arg("sheet"), overwrite).await
         }
+        "edit_spreadsheet" => edit_spreadsheet(app, &arg("path"), &arg("sheet"), args).await,
         "edit_file" => {
             let get = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
             edit_file(app, &arg("path"), &get("find"), &get("replace")).await
@@ -147,8 +180,13 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// `~/x`, a path relative to home, or an absolute one.
+/// `~/x`, a path relative to home, or an absolute one, without the stray spaces
+/// models leave around a component ("Desktop/ report.pdf").
 fn expand(path: &str) -> PathBuf {
+    expand_exact(&path.split('/').map(str::trim).collect::<Vec<_>>().join("/"))
+}
+
+fn expand_exact(path: &str) -> PathBuf {
     let path = path.trim();
     if path == "~" {
         home()
@@ -180,12 +218,23 @@ fn allowed(real: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// An existing file or folder the model may read.
+/// An existing file or folder the model may read. Models often give just a
+/// name ("report.pdf"): that is looked for on the desktop, in documents and in
+/// downloads too.
 fn readable(path: &str) -> Result<PathBuf, String> {
     if path.is_empty() {
         return Err("No path given.".into());
     }
-    let real = expand(path).canonicalize().map_err(|_| format!("{path} does not exist."))?;
+    let mut candidates = vec![expand_exact(path), expand(path)];
+    if !path.contains('/') {
+        for dir in ["Desktop", "Documents", "Downloads"] {
+            candidates.push(home().join(dir).join(path.trim()));
+        }
+    }
+    let real = candidates
+        .iter()
+        .find_map(|c| c.canonicalize().ok())
+        .ok_or_else(|| format!("{path} does not exist. Search for it with search_files."))?;
     allowed(&real)?;
     Ok(real)
 }
@@ -391,13 +440,69 @@ fn split_parts(text: &str, size: usize) -> Vec<String> {
     parts
 }
 
-async fn create_file<R: Runtime>(app: &AppHandle<R>, path: &str, content: &str, overwrite: bool) -> Result<String, String> {
+/// What to write. Models pass tables as rows and text as lines: one multi-line
+/// string is what Qwen3 most often garbles into a call the server drops.
+enum FileBody {
+    Rows(Vec<Vec<String>>),
+    Text(String),
+}
+
+fn file_body(args: &Value) -> FileBody {
+    let cell = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    if let Some(rows) = args.get("rows").and_then(Value::as_array) {
+        let rows = rows
+            .iter()
+            .map(|r| r.as_array().map(|cells| cells.iter().map(cell).collect()).unwrap_or_else(|| vec![cell(r)]))
+            .collect();
+        return FileBody::Rows(rows);
+    }
+    if let Some(lines) = args.get("lines").and_then(Value::as_array) {
+        return FileBody::Text(lines.iter().map(cell).collect::<Vec<_>>().join("\n"));
+    }
+    FileBody::Text(args.get("content").and_then(Value::as_str).unwrap_or("").to_string())
+}
+
+fn csv_line(cells: &[String]) -> String {
+    cells
+        .iter()
+        .map(|c| {
+            if c.contains([',', '"', '\n']) {
+                format!("\"{}\"", c.replace('"', "\"\""))
+            } else {
+                c.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+async fn create_file<R: Runtime>(
+    app: &AppHandle<R>,
+    path: &str,
+    body: FileBody,
+    sheet: &str,
+    overwrite: bool,
+) -> Result<String, String> {
     let target = writable(path)?;
     let exists = target.exists();
+    let is_xlsx = target.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx") || e.eq_ignore_ascii_case("xlsm"));
+    if exists && is_xlsx {
+        return Err(format!(
+            "{} already exists. Change it with edit_spreadsheet, which keeps its formatting; rewriting it would lose that.",
+            tilde(&target)
+        ));
+    }
     if exists && !overwrite {
         return Err(format!("{} already exists. Set overwrite to replace it.", tilde(&target)));
     }
-    let preview: String = content.lines().take(12).collect::<Vec<_>>().join("\n");
+    let preview: String = match &body {
+        FileBody::Rows(rows) => rows.iter().take(10).map(|r| r.join("  |  ")).collect::<Vec<_>>().join("\n"),
+        FileBody::Text(text) => text.lines().take(12).collect::<Vec<_>>().join("\n"),
+    };
     let title = if exists { "Mochi wants to replace a file" } else { "Mochi wants to create a file" };
     let detail = format!("{}\n\n{}", tilde(&target), extract::clip(&preview, 600));
     if !ask(app, title, &detail).await {
@@ -409,11 +514,19 @@ async fn create_file<R: Runtime>(app: &AppHandle<R>, path: &str, content: &str, 
         std::fs::copy(&target, &backup).map_err(|e| format!("Could not keep a backup: {e}"))?;
         note = format!(" The previous version is kept as {}.", tilde(&backup));
     }
-    let is_xlsx = target.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
-    if is_xlsx {
-        extract::write_xlsx(&target, content)?;
-    } else {
-        std::fs::write(&target, content).map_err(|e| e.to_string())?;
+    let ext = target.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    match (body, ext.as_str()) {
+        (FileBody::Rows(rows), "xlsx") => extract::write_rows_xlsx(&target, sheet, &rows)?,
+        (FileBody::Rows(rows), "csv") => {
+            let text: Vec<String> = rows.iter().map(|r| csv_line(r)).collect();
+            std::fs::write(&target, text.join("\n") + "\n").map_err(|e| e.to_string())?
+        }
+        (FileBody::Rows(rows), _) => {
+            let text: Vec<String> = rows.iter().map(|r| r.join("\t")).collect();
+            std::fs::write(&target, text.join("\n") + "\n").map_err(|e| e.to_string())?
+        }
+        (FileBody::Text(text), "xlsx") => extract::write_xlsx(&target, &text)?,
+        (FileBody::Text(text), _) => std::fs::write(&target, text).map_err(|e| e.to_string())?,
     }
     Ok(format!("Saved {}.{note}", tilde(&target)))
 }
@@ -432,14 +545,135 @@ fn backup_path(path: &Path) -> PathBuf {
     candidate
 }
 
+/// "C5" as (column 3, row 5), both from 1.
+fn cell_ref(cell: &str) -> Option<(u32, u32)> {
+    let cell = cell.trim().to_uppercase();
+    let split = cell.find(|c: char| c.is_ascii_digit())?;
+    let (letters, digits) = cell.split_at(split);
+    if letters.is_empty() || !letters.chars().all(|c| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let col = letters.chars().fold(0u32, |n, c| n * 26 + (c as u32 - 'A' as u32 + 1));
+    let row: u32 = digits.parse().ok().filter(|r| *r > 0)?;
+    Some((col, row))
+}
+
+fn open_sheet<'a>(
+    book: &'a mut umya_spreadsheet::Workbook,
+    sheet: &str,
+) -> Result<&'a mut umya_spreadsheet::Worksheet, String> {
+    if sheet.is_empty() {
+        book.sheet_mut(0).map_err(|e| e.to_string())
+    } else {
+        book.sheet_by_name_mut(sheet).map_err(|_| format!("There is no sheet called {sheet}."))
+    }
+}
+
+/// Changes a spreadsheet in place. create_file would rewrite it from bare
+/// values and lose its styles, column widths, merged cells and direction.
+async fn edit_spreadsheet<R: Runtime>(app: &AppHandle<R>, path: &str, sheet: &str, args: &Value) -> Result<String, String> {
+    let target = readable(path)?;
+    writable(&target.to_string_lossy())?;
+    let is_xlsx = target.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx") || e.eq_ignore_ascii_case("xlsm"));
+    if !is_xlsx {
+        return Err("edit_spreadsheet works on .xlsx files.".into());
+    }
+    let mut rows: Vec<u32> = args
+        .get("delete_rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .filter(|r| *r > 0)
+        .map(|r| r as u32)
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut cells: Vec<((u32, u32), String, String)> = Vec::new();
+    for entry in args.get("set_cells").and_then(Value::as_array).into_iter().flatten() {
+        let name = entry.get("cell").and_then(Value::as_str).unwrap_or("");
+        let at = cell_ref(name).ok_or_else(|| format!("\"{name}\" is not a cell like C5."))?;
+        let value = match entry.get("value") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        };
+        cells.push((at, name.trim().to_uppercase(), value));
+    }
+    if rows.is_empty() && cells.is_empty() {
+        return Err("Say which rows to delete or which cells to set.".into());
+    }
+
+    // What the user approves: the rows as they read now, and each cell's change.
+    let detail = {
+        let mut book = umya_spreadsheet::reader::xlsx::read(&target).map_err(|e| format!("Could not open it: {e}"))?;
+        let ws = open_sheet(&mut book, sheet)?;
+        let width = ws.highest_column().max(1);
+        let mut lines = vec![tilde(&target), String::new()];
+        for r in &rows {
+            let values: Vec<String> = (1..=width)
+                .filter_map(|c| ws.cell((c, *r)).map(|cell| cell.value().to_string()))
+                .filter(|v| !v.trim().is_empty())
+                .collect();
+            lines.push(format!("Delete row {r}: {}", values.join("  |  ")));
+        }
+        for ((c, r), name, value) in &cells {
+            let old = ws.cell((*c, *r)).map(|cell| cell.value().to_string()).unwrap_or_default();
+            lines.push(if old.is_empty() { format!("{name}: {value}") } else { format!("{name}: {old} -> {value}") });
+        }
+        lines.join("\n")
+    };
+    if !ask(app, "Mochi wants to change a spreadsheet", &extract::clip(&detail, 900)).await {
+        return Ok("The user declined. The spreadsheet is unchanged.".into());
+    }
+
+    let mut book = umya_spreadsheet::reader::xlsx::read(&target).map_err(|e| format!("Could not open it: {e}"))?;
+    let ws = open_sheet(&mut book, sheet)?;
+    // Cells first, at the row numbers the model read; then rows, bottom up, so
+    // each deletion leaves the numbers above it as they were.
+    for ((c, r), _, value) in &cells {
+        let empty = ws.cell((*c, *r)).is_none_or(|cell| cell.value().is_empty());
+        if empty && *r > 1 {
+            // A new entry looks like the one above it.
+            let above = ws.style((*c, *r - 1)).clone();
+            ws.set_style((*c, *r), above);
+        }
+        let leading_zero = value.len() > 1 && value.starts_with('0') && !value.starts_with("0.");
+        let cell = ws.cell_mut((*c, *r));
+        match value.trim().parse::<f64>() {
+            Ok(n) if !leading_zero && !value.trim().is_empty() => cell.set_value_number(n),
+            _ => cell.set_value(value.clone()),
+        };
+    }
+    for r in rows.iter().rev() {
+        extract::remove_row_keeping_formulas(ws, *r);
+    }
+    let backup = backup_path(&target);
+    std::fs::copy(&target, &backup).map_err(|e| format!("Could not keep a backup: {e}"))?;
+    umya_spreadsheet::writer::xlsx::write(&book, &target).map_err(|e| format!("Could not save it: {e}"))?;
+    extract::repair_saved_xlsx(&backup, &target)?;
+    Ok(format!(
+        "Changed {}. Formulas, such as totals, recompute when the file is next opened. The previous version is kept \
+as {}.",
+        tilde(&target),
+        tilde(&backup)
+    ))
+}
+
 async fn edit_file<R: Runtime>(app: &AppHandle<R>, path: &str, find: &str, replace: &str) -> Result<String, String> {
     let target = readable(path)?;
     writable(&target.to_string_lossy())?;
     if find.is_empty() {
         return Err("Say which text to replace.".into());
     }
+    let is_sheet = target
+        .extension()
+        .is_some_and(|e| ["xlsx", "xlsm"].iter().any(|x| e.eq_ignore_ascii_case(x)));
+    if is_sheet {
+        return Err("That is a spreadsheet: change it with edit_spreadsheet, which keeps its formatting.".into());
+    }
     let text = std::fs::read_to_string(&target)
-        .map_err(|_| format!("{} is not a text file; use create_file to rewrite it.", tilde(&target)))?;
+        .map_err(|_| format!("{} is not a text file, so it can't be edited here.", tilde(&target)))?;
     match text.matches(find).count() {
         0 => return Err("That text is not in the file. Read it again and copy the exact text.".into()),
         1 => {}
@@ -650,6 +884,32 @@ mod tests {
         let parts = split_parts(&text, 6);
         assert!(parts.iter().all(|p| p.chars().count() <= 6));
         assert_eq!(parts.concat(), text);
+    }
+
+    #[test]
+    fn rows_and_lines_become_the_file_body() {
+        match file_body(&json!({ "rows": [["a", "b"], ["1", 2.5]] })) {
+            FileBody::Rows(rows) => assert_eq!(rows, vec![vec!["a", "b"], vec!["1", "2.5"]]),
+            FileBody::Text(_) => panic!("rows expected"),
+        }
+        match file_body(&json!({ "lines": ["one", "two"] })) {
+            FileBody::Text(t) => assert_eq!(t, "one\ntwo"),
+            FileBody::Rows(_) => panic!("text expected"),
+        }
+        assert_eq!(csv_line(&["a,b".into(), "say \"hi\"".into(), "c".into()]), "\"a,b\",\"say \"\"hi\"\"\",c");
+    }
+
+    #[test]
+    fn stray_spaces_in_a_path_are_dropped() {
+        assert_eq!(expand("~/Desktop/ report.pdf"), home().join("Desktop/report.pdf"));
+    }
+
+    #[test]
+    fn cell_references_parse_like_excel() {
+        assert_eq!(cell_ref("C5"), Some((3, 5)));
+        assert_eq!(cell_ref(" aa10 "), Some((27, 10)));
+        assert_eq!(cell_ref("5C"), None);
+        assert_eq!(cell_ref("C0"), None);
     }
 
     #[test]

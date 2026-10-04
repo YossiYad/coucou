@@ -186,7 +186,7 @@ mod tests {
     fn a_pdf_is_sent_as_an_input_file() {
         let turn = UserTurn {
             text: "what is this".into(),
-            file: Some(ai::FileNote { name: "r.pdf".into(), content: Some(Attachment::Pdf(b"%PDF".to_vec())) }),
+            file: Some(ai::FileNote { name: "r.pdf".into(), origin: None, content: Some(Attachment::Pdf(b"%PDF".to_vec())) }),
             window: None,
         };
         let message = user_message(&turn);
