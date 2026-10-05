@@ -121,8 +121,6 @@ export interface Settings {
   screenSharing: boolean;
   /** "mouse": the monitor the mouse is on; "all": every monitor. */
   screenScope: "mouse" | "all";
-  /** The edge the island is docked to, set by dragging it. */
-  dock: "top" | "left" | "right";
   /** The monitor it was dragged to; empty follows `screen`. */
   dockScreen: string;
   /** Start on the main screen every time, wherever it was dragged before. */
@@ -247,7 +245,6 @@ export const DEFAULT_SETTINGS: Settings = {
   aiFallback: true,
   screenSharing: false,
   screenScope: "mouse",
-  dock: "top",
   dockScreen: "",
   startOnMainScreen: true,
   speakAnswers: true,

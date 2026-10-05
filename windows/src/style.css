@@ -65,23 +65,6 @@ body {
 
 /* ── Island ─────────────────────────────────────────────────────────────── */
 
-[data-dock="left"] #wake-strip,
-[data-dock="right"] #wake-strip {
-  top: 50%;
-  transform: translateY(-50%);
-  width: 6px;
-  height: 240px;
-}
-
-[data-dock="left"] #wake-strip {
-  left: 0;
-}
-
-[data-dock="right"] #wake-strip {
-  left: auto;
-  right: 0;
-}
-
 #island {
   position: absolute;
   top: 0;

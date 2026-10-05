@@ -10,7 +10,7 @@ import { h, clear } from "../views/dom";
 let settings: Settings = { ...DEFAULT_SETTINGS };
 /** Puts the permission mode chosen in the island into the select. */
 let syncMode = () => {};
-/** Puts a dock chosen by dragging the island into the selects. */
+/** Keeps the start option in step with the island. */
 let syncPlace = () => {};
 let version = "";
 /** Where API keys live on this platform, for the wording only. */
@@ -756,18 +756,6 @@ function generalSection(): HTMLElement {
     void save();
   });
 
-  // Where on the screen: changed here, or by dragging the island.
-  const dock = h("select", {}) as HTMLSelectElement;
-  dock.append(
-    h("option", { value: "top", text: "Top, centre" }),
-    h("option", { value: "left", text: "Left edge, middle" }),
-    h("option", { value: "right", text: "Right edge, middle" }),
-  );
-  dock.value = settings.dock;
-  dock.addEventListener("change", () => {
-    settings.dock = dock.value as Settings["dock"];
-    void save();
-  });
   const startOn = h("select", {}) as HTMLSelectElement;
   startOn.append(
     h("option", { value: "main", text: "On the main screen" }),
@@ -779,7 +767,6 @@ function generalSection(): HTMLElement {
     void save();
   });
   syncPlace = () => {
-    dock.value = settings.dock;
     startOn.value = settings.startOnMainScreen ? "main" : "last";
   };
 
@@ -801,11 +788,7 @@ function generalSection(): HTMLElement {
       h("label", { text: "Island lives on" }),
       screen,
     ),
-    h("div", { class: "row" },
-      h("label", { text: "Position" }),
-      dock,
-      h("span", { class: "hint", text: "or drag the island to an edge" }),
-    ),
+    h("div", { class: "hint", text: "Drag the island to move it to another screen." }),
     h("div", { class: "row" },
       h("label", { text: "When it starts" }),
       startOn,

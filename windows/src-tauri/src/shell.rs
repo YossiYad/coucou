@@ -82,6 +82,53 @@ pub fn is_read_only(command: &str) -> bool {
     words[rule.len()..].iter().all(|w| !w.contains('/') && !w.starts_with('~') && !w.starts_with('.'))
 }
 
+/// Programs that only look at things, for deciding whether a task has changed
+/// anything yet (a model that fails after only looking can simply be replaced).
+/// Broader than READ_ONLY, which is what may run without asking.
+pub fn only_looks(command: &str) -> bool {
+    if is_read_only(command) {
+        return true;
+    }
+    let lower = command.to_lowercase();
+    if lower.contains('>') || lower.contains("tee ") || lower.contains("-delete") || lower.contains("-exec") {
+        return false;
+    }
+    const LOOKERS: &[&str] = &[
+        "cat", "ls", "head", "tail", "grep", "rg", "find", "stat", "file", "du", "df", "free", "uname", "uptime", "which",
+        "whoami", "id", "ps", "pgrep", "lsblk", "lscpu", "lsusb", "lspci", "ip", "nmcli", "swapon", "journalctl",
+        "date", "echo", "printf", "wc", "sort", "uniq", "readlink", "realpath", "env", "printenv", "hostname",
+    ];
+    let systemctl_looks = |words: &[&str]| {
+        words.get(1).is_some_and(|v| {
+            ["status", "show", "cat", "list-units", "list-unit-files", "list-timers"].contains(v) || v.starts_with("is-") || v.starts_with("can-")
+        })
+    };
+    // Every command in a pipe or chain must only look.
+    lower.split(['|', ';', '&']).filter(|part| !part.trim().is_empty()).all(|part| {
+        let words: Vec<&str> = part.split_whitespace().collect();
+        match words.first().map(|w| w.rsplit('/').next().unwrap_or(w)) {
+            Some("systemctl") => systemctl_looks(&words),
+            Some(program) => LOOKERS.contains(&program) || is_read_only(part.trim()),
+            None => true,
+        }
+    })
+}
+
+/// Places where secrets live. read_file never goes into hidden folders; a
+/// command that names one of these asks first in Auto mode, so the terminal is
+/// not a way around that.
+const SECRETS: &[&str] = &[
+    ".ssh", ".gnupg", ".env", ".netrc", ".aws", ".kube", ".docker/config", ".password-store", "keyrings", ".pki",
+    ".mozilla", ".thunderbird", "google-chrome", "chromium", "bravesoftware", ".git-credentials", "id_rsa",
+    "id_ed25519", "credentials", "secrets", "token", ".config/coucou", "kwalletd", ".local/share/kwalletd",
+];
+
+/// Whether a command reaches into a place secrets are kept.
+pub fn touches_secrets(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    SECRETS.iter().any(|s| lower.contains(s)) || lower.contains("secret-tool") || lower.contains("kwallet-query")
+}
+
 /// Something that cannot be taken back: deleting, wiping, force-pushing,
 /// closing apps (unsaved work), shutting down, or running a downloaded script.
 /// Auto mode asks before these and only these.
@@ -96,7 +143,17 @@ pub fn is_dangerous(command: &str) -> bool {
     const PROGRAMS: &[&str] = &[
         "rm", "rmdir", "shred", "unlink", "dd", "wipefs", "fdisk", "sfdisk", "parted", "sgdisk", "truncate", "kill",
         "pkill", "killall", "shutdown", "reboot", "poweroff", "halt", "mv",
+        // Administrator rights, and leaving the session: never without a yes.
+        "sudo", "pkexec", "su", "doas", "run0", "loginctl",
     ];
+    // Cancelling a timer Coucou scheduled itself undoes, rather than does.
+    let own_timers = has("systemctl")
+        && has("--user")
+        && (has("stop") || has("disable"))
+        && words.iter().filter(|w| !w.starts_with('-') && !["systemctl", "stop", "disable"].contains(w)).all(|w| w.starts_with("coucou-"));
+    if own_timers {
+        return false;
+    }
     if PROGRAMS.iter().any(|p| has(p)) || words.iter().any(|w| w.starts_with("mkfs")) {
         return true;
     }
@@ -105,7 +162,15 @@ pub fn is_dangerous(command: &str) -> bool {
             || (has("branch") && has("-d")) || (has("checkout") && has("--")) || has("restore"));
     let other = (has("gh") && has("delete"))
         || has("--delete-data")
-        || (has("systemctl") && (has("reboot") || has("poweroff") || has("halt")))
+        // Power states (a hibernate ran unasked once) and stopping services.
+        || (has("systemctl")
+            && ["reboot", "poweroff", "halt", "hibernate", "suspend", "hybrid-sleep", "suspend-then-hibernate", "kexec",
+                "rescue", "emergency", "isolate", "stop", "disable", "mask", "kill"]
+                .iter()
+                .any(|v| has(v)))
+        // Hibernate or suspend asked some other way (busctl, dbus-send...);
+        // "can-hibernate" only asks whether it could.
+        || ["hibernate", "suspend"].iter().any(|w| words.iter().any(|x| x.contains(w) && !x.starts_with("can-")))
         || (has("chmod") || has("chown")) && (has("-r") || has("--recursive"))
         || (has("crontab") && has("-r"))
         || (has("find") && (has("-delete") || has("-exec")))
@@ -113,6 +178,12 @@ pub fn is_dangerous(command: &str) -> bool {
         || has("--no-preserve-root");
     // A download piped straight into a shell runs code nobody has looked at.
     let piped_script = (lower.contains("curl") || lower.contains("wget")) && (lower.contains("| sh") || lower.contains("| bash") || lower.contains("|sh") || lower.contains("|bash"));
+    // Writing into the system: /sys, /proc, /etc, /dev, /boot (tee or a redirect).
+    let system_write = (has("tee") || lower.contains('>'))
+        && ["/sys/", "/proc/", "/etc/", "/dev/sd", "/dev/nvme", "/boot/", "/usr/"].iter().any(|p| lower.contains(p));
+    if system_write {
+        return true;
+    }
     // Overwriting a file with > (appending with >> or writing to /dev/null is fine).
     let overwrite = lower.replace(">>", "").replace("2>&1", "").replace("> /dev/null", "").replace(">/dev/null", "").contains('>');
     git_danger || other || piped_script || overwrite
@@ -146,10 +217,43 @@ fn terminate(child: &Arc<Mutex<std::process::Child>>) {
     let _ = child.lock().unwrap().kill();
 }
 
+/// How long a `sleep` in the command waits, in seconds (the longest one).
+fn longest_sleep(command: &str) -> u64 {
+    let words: Vec<&str> = command.split(|c: char| c.is_whitespace() || ";&|()".contains(c)).filter(|w| !w.is_empty()).collect();
+    words
+        .windows(2)
+        .filter(|w| w[0] == "sleep")
+        .filter_map(|w| {
+            let arg = w[1];
+            let (number, unit) = arg.split_at(arg.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(arg.len()));
+            let n: f64 = number.parse().ok()?;
+            let factor = match unit {
+                "" | "s" => 1.0,
+                "m" => 60.0,
+                "h" => 3600.0,
+                "d" => 86400.0,
+                _ => return None,
+            };
+            Some((n * factor) as u64)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 pub async fn run_command<R: Runtime>(app: &AppHandle<R>, step: u64, mode: Mode, command: &str, why: &str) -> Result<String, String> {
     let command = command.trim();
     if command.is_empty() {
         return Err("Say which command to run.".into());
+    }
+    // "In an hour" once became "now": a delay is scheduled, never waited out
+    // inside a command (which would also hold the whole task for that long).
+    if longest_sleep(command) >= 60 {
+        return Err(
+            "Do not wait inside a command. To do something later, schedule it and return at once: systemd-run --user \
+--on-active=1h --unit=coucou-<name> <command> (or --on-calendar='23:00'), then tell the user when it will happen and \
+that systemctl --user stop coucou-<name>.timer cancels it."
+                .into(),
+        );
     }
     if command.chars().count() > MAX_COMMAND {
         return Err("That command is too long; split it into steps.".into());
@@ -165,7 +269,7 @@ pub async fn run_command<R: Runtime>(app: &AppHandle<R>, step: u64, mode: Mode, 
     // Manual asks every time; Accept edits lets reading through; Auto asks only
     // before what cannot be undone.
     let waiting = match mode {
-        Mode::Auto => is_dangerous(command),
+        Mode::Auto => is_dangerous(command) || touches_secrets(command),
         Mode::AcceptEdits => !is_read_only(command),
         _ => true,
     };
@@ -334,6 +438,13 @@ issues and releases (gh repo create, gh pr create --fill, gh repo clone); if it 
 to run gh auth login once.",
         );
     }
+    note.push_str(
+        " When the user asks for something later (in an hour, at 23:00, tomorrow morning), never do it now: schedule \
+it with systemd-run --user --on-active=1h --unit=coucou-<short name> <command> (or --on-calendar='2026-10-05 23:00'), \
+which returns at once, then say when it will happen and that saying 'cancel' (systemctl --user stop \
+coucou-<short name>.timer) undoes it. To list what is scheduled: systemctl --user list-timers 'coucou-*'. Hibernate and \
+suspend need no password: systemctl hibernate.",
+    );
     if atomic {
         note.push_str(
             " It is an image-based (atomic) Fedora system: apps are Flatpaks (flatpak update -y updates them all, \
@@ -386,7 +497,29 @@ mod tests {
         ] {
             assert!(is_dangerous(risky), "{risky} should ask");
         }
+        for power in [
+            "pkexec systemctl hibernate",
+            "systemctl suspend",
+            "echo 'hibernate' | sudo tee /sys/power/state",
+            "echo mem > /sys/power/state",
+            "sudo flatpak update",
+            "loginctl terminate-session 2",
+            "systemctl --user stop pipewire",
+        ] {
+            assert!(is_dangerous(power), "{power} should ask");
+        }
+        assert!(!is_dangerous("systemctl can-hibernate"), "asking whether it can hibernate only looks");
+        for look in ["systemctl can-hibernate", "cat /sys/power/state", "swapon --show", "cat /sys/power/resume | head -1", "journalctl -b -1 | tail -20"] {
+            assert!(only_looks(look), "{look} only looks");
+        }
+        for change in ["pkexec systemctl hibernate", "flatpak update -y", "echo x > a.txt", "find . -delete", "systemctl restart x"] {
+            assert!(!only_looks(change), "{change} changes something");
+        }
         assert!(is_read_only("git -C ~/projects/coucou status"), "git -C folder status only looks");
+        for secret in ["cat ~/.ssh/id_ed25519", "cat ~/projects/app/.env", "secret-tool lookup service x", "cp ~/.git-credentials /tmp"] {
+            assert!(touches_secrets(secret), "{secret} should ask in Auto");
+        }
+        assert!(!touches_secrets("cat ~/.local/bin/pull-others-repos.sh"), "an ordinary script is not a secret");
         assert!(is_read_only("gh pr list"));
     }
 
@@ -402,6 +535,20 @@ mod tests {
         assert!(!is_read_only("flatpak info ~/x"));
         assert!(!is_read_only("rm -rf /"));
         assert!(!is_read_only("dfx"));
+    }
+
+    #[test]
+    fn waiting_inside_a_command_is_refused_but_scheduling_is_not() {
+        assert_eq!(longest_sleep("sleep 3600 && systemctl hibernate"), 3600);
+        assert_eq!(longest_sleep("sleep 1h; systemctl hibernate"), 3600);
+        assert_eq!(longest_sleep("(sleep 90m; echo hi) &"), 5400);
+        assert_eq!(longest_sleep("sleep 2 && ls"), 2);
+        assert_eq!(longest_sleep("systemd-run --user --on-active=1h --unit=coucou-hibernate systemctl hibernate"), 0);
+        // Scheduling a hibernate still asks first in Auto.
+        assert!(is_dangerous("systemd-run --user --on-active=1h --unit=coucou-hibernate systemctl hibernate"));
+        assert!(!is_dangerous("systemctl --user list-timers 'coucou-*'"));
+        assert!(!is_dangerous("systemctl --user stop coucou-hibernate.timer"), "cancelling its own timer is safe");
+        assert!(is_dangerous("systemctl --user stop pipewire"), "stopping anything else is not");
     }
 
     #[test]

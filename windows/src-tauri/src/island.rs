@@ -42,50 +42,13 @@ pub const STRIP_H: f64 = 6.0;
 
 pub const WINDOW_LABEL: &str = "island";
 
-/// The edge the island is docked to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Dock {
-    Top,
-    Left,
-    Right,
-}
-
-impl Dock {
-    pub fn parse(id: &str) -> Self {
-        match id {
-            "left" => Self::Left,
-            "right" => Self::Right,
-            _ => Self::Top,
-        }
-    }
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::Top => "top",
-            Self::Left => "left",
-            Self::Right => "right",
-        }
-    }
-}
-
-/// The dock and the monitor it was dragged to, from the settings.
-fn placement(app: &AppHandle) -> (Dock, String) {
+/// The monitor the island was dragged to, from the settings (empty: none).
+fn dragged_screen(app: &AppHandle) -> String {
     app.try_state::<crate::Shared>()
-        .map(|s| {
-            let settings = s.settings.lock().unwrap();
-            (Dock::parse(&settings.dock), settings.dock_screen.clone())
-        })
-        .unwrap_or((Dock::Top, String::new()))
+        .map(|s| s.settings.lock().unwrap().dock_screen.clone())
+        .unwrap_or_default()
 }
 
-/// The wake strip's size: along the edge the island is docked to.
-pub fn strip_size(dock: Dock) -> (f64, f64) {
-    if dock == Dock::Top {
-        (STRIP_W, STRIP_H)
-    } else {
-        (STRIP_H, STRIP_W)
-    }
-}
 
 /// Margin around the island that still counts as "on the island", in logical px.
 /// Wider than the macOS 6 pt because a click must never be swallowed.
@@ -246,7 +209,7 @@ fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
 fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
     let monitors = app.available_monitors().ok()?;
     // Dragged to a monitor: that one, while it is connected.
-    let (_, dock_screen) = placement(app);
+    let dock_screen = dragged_screen(app);
     if !dock_screen.is_empty() {
         if let Some(m) = monitors.iter().find(|m| m.name().is_some_and(|n| *n == dock_screen)) {
             return Some(m.clone());
@@ -292,15 +255,11 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let mp = *m.position();
     let ms = *m.size();
 
-    let (dock, _) = placement(app);
-    let (lw, lh) = if collapsed { strip_size(dock) } else { (PANEL_W, PANEL_H) };
+    let (lw, lh) = if collapsed { (STRIP_W, STRIP_H) } else { (PANEL_W, PANEL_H) };
     let pw = (lw * scale).round().max(1.0) as u32;
     let ph = (lh * scale).round().max(1.0) as u32;
-    let (x, y) = match dock {
-        Dock::Top => (mp.x + (ms.width as i32 - pw as i32) / 2, mp.y),
-        Dock::Left => (mp.x, mp.y + (ms.height as i32 - ph as i32) / 2),
-        Dock::Right => (mp.x + ms.width as i32 - pw as i32, mp.y + (ms.height as i32 - ph as i32) / 2),
-    };
+    let x = mp.x + (ms.width as i32 - pw as i32) / 2;
+    let y = mp.y;
 
     // GTK never sizes a non-resizable window below its natural size (200 px
     // here), so on Linux the 6 px wake strip would stay a 200 px block. tao
@@ -543,7 +502,6 @@ pub fn update_input_region(app: &AppHandle, gate: &PollGate) {
     let Some(win) = window(app) else { return };
     let collapsed = gate.collapsed.load(Ordering::Relaxed);
     let r = gate.rect();
-    let (strip_w, strip_h) = strip_size(placement(app).0);
     let _ = app.run_on_main_thread(move || {
         use gtk::cairo::{RectangleInt, Region};
         use gtk::prelude::*;
@@ -556,7 +514,7 @@ pub fn update_input_region(app: &AppHandle, gate: &PollGate) {
             // Only the wake strip, even if the window manager kept the window
             // larger than asked: an invisible block at the top of the screen
             // swallowing clicks is the one thing this must never be.
-            Region::create_rectangle(&RectangleInt::new(0, 0, strip_w as i32, strip_h as i32))
+            Region::create_rectangle(&RectangleInt::new(0, 0, STRIP_W as i32, STRIP_H as i32))
         } else if r.w > 0.0 {
             let x = (r.x - HIT_MARGIN).max(0.0).floor() as i32;
             let y = (r.y - HIT_MARGIN).max(0.0).floor() as i32;
@@ -597,43 +555,25 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
     });
 }
 
-/// Where a dragged island lands: the monitor its centre is over (or the
-/// nearest), and the closest of that monitor's three docks.
-pub fn snap_target(monitors: &[(String, i32, i32, u32, u32)], cx: f64, cy: f64) -> Option<(String, Dock)> {
-    let inside = |&&(_, x, y, w, h): &&(String, i32, i32, u32, u32)| {
-        cx >= x as f64 && cx < x as f64 + w as f64 && cy >= y as f64 && cy < y as f64 + h as f64
-    };
+/// The screen a dragged island lands on: the one its centre is over, or the
+/// nearest when it was dropped past the edge of them all.
+pub fn snap_target(monitors: &[(String, i32, i32, u32, u32)], cx: f64, cy: f64) -> Option<String> {
     let distance = |&(_, x, y, w, h): &(String, i32, i32, u32, u32)| {
         let dx = (cx - (x as f64 + w as f64 / 2.0)).abs() - w as f64 / 2.0;
         let dy = (cy - (y as f64 + h as f64 / 2.0)).abs() - h as f64 / 2.0;
         dx.max(0.0).hypot(dy.max(0.0))
     };
-    let m = monitors.iter().find(inside).or_else(|| {
-        monitors.iter().min_by(|a, b| distance(a).partial_cmp(&distance(b)).unwrap_or(std::cmp::Ordering::Equal))
-    })?;
-    let (name, x, y, w, h) = m.clone();
-    let (x, y, w, h) = (x as f64, y as f64, w as f64, h as f64);
-    let anchors = [
-        (Dock::Top, x + w / 2.0, y),
-        (Dock::Left, x, y + h / 2.0),
-        (Dock::Right, x + w, y + h / 2.0),
-    ];
-    let dock = anchors
+    monitors
         .iter()
-        .min_by(|a, b| {
-            let da = (a.1 - cx).hypot(a.2 - cy);
-            let db = (b.1 - cx).hypot(b.2 - cy);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        })?
-        .0;
-    Some((name, dock))
+        .min_by(|a, b| distance(a).partial_cmp(&distance(b)).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|m| m.0.clone())
 }
 
 static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAST_MOVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The user started dragging the island: the window manager moves it, and
-/// when the mouse button is let go it snaps to the nearest dock. Snapping on
+/// when the mouse button is let go it goes to the top centre of that screen. Snapping on
 /// a pause instead fired mid-drag when the hand stopped for a moment, and the
 /// island then stayed wherever it was dropped.
 pub fn start_drag(app: &AppHandle) {
@@ -737,12 +677,11 @@ fn snap(app: &AppHandle) {
             (m.name().cloned().unwrap_or_default(), p.x, p.y, s.width, s.height)
         })
         .collect();
-    let Some((screen, dock)) = snap_target(&monitors, cx, cy) else { return };
-    crate::log::line(format!("island docked {} on {screen}", dock.id()));
+    let Some(screen) = snap_target(&monitors, cx, cy) else { return };
+    crate::log::line(format!("island moved to {screen}"));
     let settings = {
         let shared = app.state::<crate::Shared>();
         let mut s = shared.settings.lock().unwrap();
-        s.dock = dock.id().into();
         s.dock_screen = screen;
         s.clone()
     };
@@ -759,13 +698,12 @@ mod dock_tests {
     use super::*;
 
     #[test]
-    fn a_dragged_island_snaps_to_the_nearest_edge_of_its_screen() {
+    fn a_dragged_island_goes_to_the_screen_it_was_dropped_on() {
         let monitors = vec![("DP-1".to_string(), 0, 0, 3440, 1440), ("HDMI-A-2".to_string(), 3440, 0, 1920, 1080)];
-        assert_eq!(snap_target(&monitors, 1720.0, 150.0), Some(("DP-1".into(), Dock::Top)));
-        assert_eq!(snap_target(&monitors, 300.0, 700.0), Some(("DP-1".into(), Dock::Left)));
-        assert_eq!(snap_target(&monitors, 3200.0, 800.0), Some(("DP-1".into(), Dock::Right)));
-        assert_eq!(snap_target(&monitors, 4400.0, 100.0), Some(("HDMI-A-2".into(), Dock::Top)));
+        assert_eq!(snap_target(&monitors, 1720.0, 150.0).as_deref(), Some("DP-1"));
+        assert_eq!(snap_target(&monitors, 300.0, 1300.0).as_deref(), Some("DP-1"));
+        assert_eq!(snap_target(&monitors, 4400.0, 100.0).as_deref(), Some("HDMI-A-2"));
         // Dropped past the last screen: the nearest one.
-        assert_eq!(snap_target(&monitors, 5600.0, 500.0).map(|t| t.0), Some("HDMI-A-2".into()));
+        assert_eq!(snap_target(&monitors, 5600.0, 500.0).as_deref(), Some("HDMI-A-2"));
     }
 }

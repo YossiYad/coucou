@@ -64,11 +64,7 @@ pub struct Settings {
     /// "mouse" (the monitor the mouse is on) or "all".
     #[serde(default = "default_screen_scope")]
     pub screen_scope: String,
-    /// Where the island sits: "top" (centre of the top edge), "left" or
-    /// "right" (middle of that edge). Set by dragging it.
-    #[serde(default = "default_dock")]
-    pub dock: String,
-    /// The monitor it was dragged to, by name; empty follows `screen`.
+    /// The monitor the island was dragged to, by name; empty follows `screen`.
     #[serde(default)]
     pub dock_screen: String,
     /// On every start the island comes up on the main screen, wherever it was
@@ -82,10 +78,6 @@ pub struct Settings {
     /// system default.
     #[serde(default)]
     pub microphone: String,
-}
-
-fn default_dock() -> String {
-    "top".into()
 }
 
 fn default_screen_scope() -> String {
@@ -142,7 +134,6 @@ impl Default for Settings {
             ai_fallback: true,
             screen_sharing: false,
             screen_scope: default_screen_scope(),
-            dock: default_dock(),
             dock_screen: String::new(),
             start_on_main_screen: true,
             speak_answers: true,

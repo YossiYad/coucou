@@ -16,6 +16,12 @@ use crate::{claude, gemini, openai};
 /// often read, read the next part, edit, check.
 const MAX_STEPS: usize = 20;
 
+/// Added to the second and later web searches of a question: models kept
+/// rephrasing a search whose snippets lacked the answer (five searches and a
+/// curl for a dollar rate).
+pub const SEARCH_ENOUGH: &str = "\n\n(You have searched enough for this question. Do not search again: open the most \
+promising result with read_web_page, or answer from what you have.)";
+
 /// One tool call, in every provider's terms.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
@@ -43,7 +49,9 @@ do something (create, change, delete, find, open, look up), do it with the tools
 briefly what you did. A file the user dropped comes with the place it was dropped from: read or change it there. Read a \
 file before changing it, and use the row, column and paragraph numbers read_file shows. The user's home folder is {home}; \
 their desktop is {home}/Desktop and their documents are in {home}/Documents. Today is {y:04}-{mo:02}-{d:02}. Read only as \
-much of a long file as the question needs.",
+much of a long file as the question needs. Match the effort to the question: a simple question (a fact, a \
+conversion, a definition, a quick how-to) gets a direct answer, with at most one search when it needs current data; \
+never repeat a search in other words.",
         crate::ai::system_prompt(web_search)
     );
     text.push_str(
@@ -72,7 +80,14 @@ pub async fn run<R: Runtime>(
     history: &[Value],
 ) -> Result<Answer, String> {
     let mode = Mode::parse(&settings.permission_mode);
-    let definitions = tools::definitions(mode);
+    let mut definitions = tools::definitions(mode);
+    // With screen sharing on, every question already carries a screenshot:
+    // looking again would only cost a second one.
+    if settings.screen_sharing {
+        if let Some(list) = definitions.as_array_mut() {
+            list.retain(|t| t.pointer("/function/name").and_then(Value::as_str) != Some("look_at_screen"));
+        }
+    }
     // Gemini's own search costs a quota a free key runs out of; it searches
     // through the search_web tool instead.
     let system = prompt(matches!(provider, Provider::Anthropic | Provider::OpenAi), mode);
@@ -82,6 +97,7 @@ pub async fn run<R: Runtime>(
     // start the question over. After that it carries on from `progress`.
     let mut changed = false;
     let mut progress: Vec<String> = Vec::new();
+    let mut searches = 0usize;
 
     for _ in 0..MAX_STEPS {
         let step = match provider {
@@ -96,7 +112,7 @@ pub async fn run<R: Runtime>(
             // Something was already changed: the next model gets told what, so
             // it carries on instead of doing it twice.
             Err(err) => {
-                crate::log::line(format!("agent: stopped after changing things: {err}"));
+                crate::log::line(format!("agent: stopped half-way: {}", err.chars().take(160).collect::<String>()));
                 return Err(crate::fallback::with_progress(&err, &progress));
             }
         };
@@ -118,22 +134,31 @@ pub async fn run<R: Runtime>(
                 }
                 let mut outputs = Vec::with_capacity(calls.len());
                 for call in &calls {
-                    let output = tools::run(app, &call.name, &call.args, mode).await;
+                    let mut output = tools::run(app, &call.name, &call.args, mode).await;
+                    searches += usize::from(call.name == "search_web");
+                    if searches >= 2 && call.name == "search_web" {
+                        output.text.push_str(SEARCH_ENOUGH);
+                    }
                     let outcome = if output.text.starts_with("Error:") { output.text.as_str() } else { "ok" };
                     crate::log::line(format!("tool: {} {} -> {outcome}", call.name, summary(&call.args)));
                     used.push(format!("{} {}", call.name, summary(&call.args)));
-                    let did_change = !output.text.starts_with(tools::DECLINED)
-                        && if call.name == "run_command" {
-                            !crate::shell::is_read_only(call.args.get("command").and_then(Value::as_str).unwrap_or(""))
-                        } else {
-                            tools::changes_things(&call.name)
-                        };
+                    let command = call.args.get("command").and_then(Value::as_str).unwrap_or("");
+                    let ran = !output.text.starts_with(tools::DECLINED);
+                    let did_change = ran
+                        && if call.name == "run_command" { !crate::shell::only_looks(command) } else { tools::changes_things(&call.name) };
                     changed |= did_change;
+                    // Something that cannot be undone ran: nobody takes this task
+                    // over (a hibernate was done twice that way).
+                    let mark = if ran && call.name == "run_command" && crate::shell::is_dangerous(command) {
+                        crate::fallback::IRREVERSIBLE
+                    } else {
+                        ""
+                    };
                     progress.push(format!(
-                        "{} {} -> {}",
+                        "{mark}{} {} -> {}",
                         call.name,
                         summary(&call.args),
-                        crate::extract::clip(output.text.lines().next().unwrap_or(""), 200)
+                        output.text.lines().next().unwrap_or("").chars().take(200).collect::<String>()
                     ));
                     outputs.push(output);
                 }

@@ -120,6 +120,7 @@ async fn agent<R: Runtime>(
     // Whether the last tool call failed, and whether the model was already
     // pushed once to act on what it announced.
     let mut last_failed = false;
+    let mut searches = 0usize;
     let mut nudged = false;
 
     for _ in 0..MAX_STEPS {
@@ -197,7 +198,11 @@ async fn agent<R: Runtime>(
                 None => json!({}),
             };
             let output = tools::run(app, name, &args, mode).await;
-            let result = output.text;
+            let mut result = output.text;
+            searches += usize::from(name == "search_web");
+            if searches >= 2 && name == "search_web" {
+                result.push_str(crate::agent::SEARCH_ENOUGH);
+            }
             last_failed = result.starts_with("Error:") || result.starts_with("Failed with exit code");
             let outcome = if result.starts_with("Error:") { result.as_str() } else { "ok" };
             crate::log::line(format!("tool: {name} {} -> {outcome}", crate::agent::summary(&args)));

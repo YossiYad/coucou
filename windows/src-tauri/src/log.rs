@@ -19,6 +19,9 @@ pub fn line(message: impl AsRef<str>) {
         let _ = std::fs::remove_file(&path);
     }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{stamp} {}", message.as_ref());
+        // One entry, one line: a multi-line command or error must not read as
+        // lines of its own.
+        let flat = message.as_ref().replace("\r\n", " | ").replace(['\n', '\r'], " | ");
+        let _ = writeln!(file, "{stamp} {flat}");
     }
 }

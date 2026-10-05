@@ -189,6 +189,66 @@ pub fn adopt(answer: Answer, provider: Provider) -> Answer {
     Answer { stored: stored_text(provider, &answer.text), text: answer.text }
 }
 
+/// Models and accounts that just said no, and until when to leave them be.
+static RESTING: std::sync::Mutex<Vec<(Target, std::time::Instant, &'static str)>> = std::sync::Mutex::new(Vec::new());
+/// A quota with no time given rests this long; an overloaded model a minute.
+const QUOTA_REST: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const BUSY_REST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// "try again in 7h5m2.38s" as a duration.
+pub fn retry_after(err: &str) -> Option<std::time::Duration> {
+    let rest = err.split("try again in ").nth(1)?;
+    let spec: String = rest.chars().take_while(|c| c.is_ascii_digit() || matches!(c, 'h' | 'm' | 's' | '.')).collect();
+    let mut total = 0f64;
+    let mut number = String::new();
+    for c in spec.chars() {
+        match c {
+            'h' => total += number.parse::<f64>().ok()? * 3600.0,
+            'm' => total += number.parse::<f64>().ok()? * 60.0,
+            's' => total += number.parse::<f64>().ok()?,
+            _ => {
+                number.push(c);
+                continue;
+            }
+        }
+        number.clear();
+    }
+    (total > 0.0).then(|| std::time::Duration::from_secs_f64(total))
+}
+
+/// Remembers a model that ran out of quota or was overloaded, so the next
+/// questions go straight past it.
+pub fn note_failure(target: &Target, err: &str) {
+    let lower = err.to_lowercase();
+    let (rest, why) = if lower.contains("quota") || lower.contains(" 429") {
+        (retry_after(err).unwrap_or(QUOTA_REST).min(std::time::Duration::from_secs(24 * 3600)), "out of quota")
+    } else if lower.contains("high demand") || lower.contains("overloaded") || lower.contains(" 503") {
+        (BUSY_REST, "overloaded")
+    } else {
+        return;
+    };
+    let mut list = RESTING.lock().unwrap();
+    list.retain(|(t, _, _)| t != target);
+    list.push((target.clone(), std::time::Instant::now() + rest, why));
+}
+
+/// Why `target` is being left alone right now, if it is.
+pub fn resting(target: &Target) -> Option<&'static str> {
+    let mut list = RESTING.lock().unwrap();
+    let now = std::time::Instant::now();
+    list.retain(|(_, until, _)| *until > now);
+    list.iter().find(|(t, _, _)| t == target).map(|(_, _, why)| *why)
+}
+
+/// Marks a step that cannot be undone in the list handed to the next model.
+pub const IRREVERSIBLE: &str = "(cannot be undone) ";
+
+/// Whether something that cannot be undone was already done: then the task
+/// stops with an account of it instead of passing to another model.
+pub fn has_irreversible(steps: &[String]) -> bool {
+    steps.iter().any(|s| s.starts_with(IRREVERSIBLE))
+}
+
 /// Separates an error from the steps already done, inside one error string.
 const PROGRESS: char = '\u{1e}';
 
@@ -285,6 +345,21 @@ mod tests {
         assert_eq!(list[0], Target::new(Provider::Gemini, flash, 1));
         assert!(!list.iter().any(|t| t.provider == Provider::Local));
         assert_eq!(Target::new(Provider::Gemini, flash, 2).name(), "Gemini (account 2)");
+    }
+
+    #[test]
+    fn a_used_up_quota_is_left_alone_until_google_says_it_is_back() {
+        assert_eq!(retry_after("Google says to try again in 7h5m2.38s. Each step"), Some(std::time::Duration::from_secs_f64(25502.38)));
+        assert_eq!(retry_after("try again in 41.2s."), Some(std::time::Duration::from_secs_f64(41.2)));
+        assert_eq!(retry_after("no time here"), None);
+        let target = Target::new(Provider::Gemini, "gemini-test-model", 7);
+        assert_eq!(resting(&target), None);
+        note_failure(&target, "Gemini's free quota for gemini-test-model is used up for now. Google says to try again in 2h.");
+        assert_eq!(resting(&target), Some("out of quota"));
+        let other = Target::new(Provider::Gemini, "gemini-test-model", 8);
+        assert_eq!(resting(&other), None, "another account is not affected");
+        note_failure(&other, "Gemini API 400: bad request");
+        assert_eq!(resting(&other), None, "a refused request does not rest a model");
     }
 
     #[test]

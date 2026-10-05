@@ -90,9 +90,7 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     let (screen_changed, autostart_changed) = {
         let mut current = shared.settings.lock().unwrap();
         // A new edge or screen (from Settings) places the island again.
-        let screen_changed = current.screen != settings.screen
-            || current.dock != settings.dock
-            || current.dock_screen != settings.dock_screen;
+        let screen_changed = current.screen != settings.screen || current.dock_screen != settings.dock_screen;
         let autostart_changed = current.autostart != settings.autostart;
         *current = settings.clone();
         (screen_changed, autostart_changed)
