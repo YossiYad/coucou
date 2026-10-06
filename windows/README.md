@@ -206,8 +206,10 @@ libayatana-appindicator3-dev librsvg2-dev patchelf`.
   default on Bazzite, KDE and GNOME alike) Coucou therefore runs through XWayland,
   which every Bazzite desktop includes. Set `COUCOU_NATIVE_WAYLAND=1` to stay on
   native Wayland anyway — the island then goes wherever the compositor puts it —
-  and a `GDK_BACKEND` you set yourself always wins. On a HiDPI screen, if the
-  island looks too small, start it with `GDK_SCALE=2`.
+  and a `GDK_BACKEND` you set yourself always wins. The island draws at the
+  X server's scale (KDE's Xft.dpi), so it comes out the right size on every
+  screen at once, whatever each one's own scale, fractional ones included. A
+  `GDK_SCALE` or `GDK_DPI_SCALE` you set yourself is kept.
 - **Mochi's eyes follow the mouse only over the island.** Wayland tells no app
   where the pointer is over other windows. Hovering, clicking and the wake-up
   strip at the top of the screen work as usual.

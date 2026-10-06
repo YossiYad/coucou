@@ -15,6 +15,15 @@ use std::sync::OnceLock;
 /// a browser forced onto XWayland would be blurry for no reason.
 static OWN_VARS: OnceLock<Vec<&'static str>> = OnceLock::new();
 
+/// X pixels per CSS pixel of our pages: the scale WebKitGTK draws at once
+/// `prepare_env` has had its say (see there). Unset when the X server's scale
+/// is unknown, and GTK's own scale factor is then the best guess.
+static UI_SCALE: OnceLock<f64> = OnceLock::new();
+
+fn env_f64(name: &str) -> Option<f64> {
+    std::env::var(name).ok()?.trim().parse().ok()
+}
+
 /// Must run before Tauri (and so GTK) starts, while the process is still
 /// single-threaded.
 pub fn prepare_env() {
@@ -28,20 +37,41 @@ pub fn prepare_env() {
         std::env::set_var("GDK_BACKEND", "x11");
         own.push("GDK_BACKEND");
 
-        // XWayland runs the whole X server at a single scale: the largest
-        // monitor's (200% once a 4K TV is attached). It never passes that to
-        // GTK, so GTK draws at scale 1 and KWin then shrinks every window to a
-        // fraction of its size on any less-scaled screen (the island came out
-        // tiny). KDE records the scale in Xft.dpi (96 per 100%); matching
-        // GDK_SCALE to it makes GTK draw natively at the right size, with a
-        // normal cursor and no page zoom. Integer only, which is what X uses.
-        if unset("GDK_SCALE") {
-            if let Some(scale) = xwayland_scale() {
-                if scale > 1 {
-                    std::env::set_var("GDK_SCALE", scale.to_string());
+        // XWayland runs the whole X server at a single scale, the largest
+        // monitor's (200% once a 4K TV is attached), and KWin then shows every
+        // X window on each screen at that screen's own size. KDE records the
+        // scale in Xft.dpi (96 per 100%). Draw at exactly that scale and the
+        // island comes out right on every monitor at once: sharp on the
+        // largest, shrunk by KWin on the others, whatever is plugged in.
+        //
+        // A WebKitGTK page draws at GTK's whole-number scale factor times the
+        // font resolution over 96 dpi. Left alone, GTK reads Xft.dpi 192 as
+        // scale 2 at 96 dpi. A GDK_SCALE of 2 on its own pins the scale at 2
+        // but leaves the 192 dpi, and the page then draws at 4: the island
+        // overflowed its window on both sides. So the two are set together:
+        // GDK_SCALE to the nearest whole scale, GDK_DPI_SCALE to cancel that
+        // scale's share of the dpi, and the page lands on the X server's scale
+        // exactly, even a fractional 135%. Either variable set by the user
+        // stands, and the scale is worked out from what it leaves.
+        if let Some(xscale) = xwayland_scale() {
+            let (gdk, dpi_scale) = gdk_split(xscale);
+            let gdk = match env_f64("GDK_SCALE") {
+                Some(g) if g >= 1.0 => g,
+                _ => {
+                    std::env::set_var("GDK_SCALE", gdk.to_string());
                     own.push("GDK_SCALE");
+                    gdk as f64
                 }
-            }
+            };
+            let dpi_scale = match env_f64("GDK_DPI_SCALE") {
+                Some(d) if d > 0.0 => d,
+                _ => {
+                    std::env::set_var("GDK_DPI_SCALE", &dpi_scale);
+                    own.push("GDK_DPI_SCALE");
+                    dpi_scale.parse().unwrap_or(1.0 / gdk)
+                }
+            };
+            let _ = UI_SCALE.set(gdk * dpi_scale * xscale);
         }
     }
 
@@ -83,26 +113,49 @@ pub fn clean_env(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
-/// XWayland's scale, read from Xft.dpi (96 dpi is 100%) and rounded to a whole
-/// number, since GDK_SCALE takes only integers. `None` if xrdb cannot be read
-/// or carries no Xft.dpi, in which case GTK's own value (scale 1) stands.
-pub fn xwayland_scale() -> Option<i32> {
+/// XWayland's scale, read from Xft.dpi (96 dpi is 100%), fractional when the
+/// largest screen is. `None` if xrdb cannot be read or carries no Xft.dpi, in
+/// which case GTK's own value stands.
+pub fn xwayland_scale() -> Option<f64> {
     let mut cmd = Command::new("xrdb");
     cmd.arg("-query").stdin(Stdio::null()).stderr(Stdio::null());
     let out = cmd.output().ok()?;
     scale_from_resources(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// The scale an `xrdb -query` dump implies: Xft.dpi over the standard 96 dpi,
-/// rounded, at least 1.
-fn scale_from_resources(resources: &str) -> Option<i32> {
+/// The scale an `xrdb -query` dump implies: Xft.dpi over the standard 96 dpi.
+fn scale_from_resources(resources: &str) -> Option<f64> {
     let dpi: f64 = resources
         .lines()
         .find_map(|l| l.strip_prefix("Xft.dpi:"))?
         .trim()
         .parse()
         .ok()?;
-    Some((dpi / 96.0).round().max(1.0) as i32)
+    (dpi > 0.0).then(|| dpi / 96.0)
+}
+
+/// GTK's share of the X server's scale: the nearest whole scale factor, and
+/// the GDK_DPI_SCALE (as the text the variable takes) that cancels that
+/// factor's share of the font dpi, so that a page draws at `xscale` exactly.
+fn gdk_split(xscale: f64) -> (i32, String) {
+    let gdk = xscale.round().max(1.0) as i32;
+    (gdk, format!("{:.6}", 1.0 / gdk as f64))
+}
+
+/// X pixels per CSS pixel of our pages, once `prepare_env` has run. `None` when
+/// the X server's scale is unknown; GTK's own scale factor is then the best guess.
+pub fn ui_scale() -> Option<f64> {
+    UI_SCALE.get().copied()
+}
+
+/// A size in CSS pixels as the GTK logical pixels Tauri sizes windows in. The
+/// two differ by the dpi share of the scale (see `prepare_env`): 1.35 CSS
+/// pixels to the logical pixel on a 135% screen.
+pub fn css_to_gtk(v: f64) -> f64 {
+    match (ui_scale(), env_f64("GDK_SCALE")) {
+        (Some(s), Some(g)) if g >= 1.0 => v * s / g,
+        _ => v,
+    }
 }
 
 /// XWayland's scale jumps when monitors are plugged in, unplugged or rescaled
@@ -115,24 +168,22 @@ pub fn relaunch_if_scale_changed() -> bool {
     if !OWN_VARS.get().map(|v| v.contains(&"GDK_SCALE")).unwrap_or(false) {
         return false;
     }
-    let want = match xwayland_scale() {
-        Some(s) => s,
-        None => return false,
+    let (Some(have), Some(want)) = (ui_scale(), xwayland_scale()) else {
+        return false;
     };
-    let have: i32 = std::env::var("GDK_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
-    if want == have {
+    if (want - have).abs() < 0.01 {
         return false;
     }
     let exe = match std::env::var_os("APPIMAGE").map(std::path::PathBuf::from).or_else(|| std::env::current_exe().ok()) {
         Some(p) => p,
         None => return false,
     };
-    crate::log::line(format!("screen scale changed {have} -> {want}, restarting to match"));
+    crate::log::line(format!("screen scale changed {have:.2} -> {want:.2}, restarting to match"));
     // Hand the new process a clean slate so it works the scale out from scratch
     // and the AppImage runtime sets its own library paths.
     let mut cmd = Command::new("setsid");
     cmd.arg("-f").arg(&exe).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    for var in ["GDK_SCALE", "GDK_BACKEND", "APPDIR", "APPIMAGE", "APPRUN", "OWD", "ARGV0"] {
+    for var in ["GDK_SCALE", "GDK_DPI_SCALE", "GDK_BACKEND", "APPDIR", "APPIMAGE", "APPRUN", "OWD", "ARGV0"] {
         cmd.env_remove(var);
     }
     clean_env(&mut cmd);
@@ -185,20 +236,35 @@ pub fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::scale_from_resources;
+    use super::{gdk_split, scale_from_resources};
 
     #[test]
     fn the_scale_comes_from_xft_dpi() {
         // KDE with a 200% screen: XWayland doubled, Xft.dpi 192.
-        assert_eq!(scale_from_resources("Xcursor.size:\t24\nXft.dpi:\t192\n"), Some(2));
-        // 100%; a laptop at 125% or 150% rounds to the nearest whole scale
-        // (150% goes up, so it stays sharp and KWin shrinks it a little).
-        assert_eq!(scale_from_resources("Xft.dpi:\t96\n"), Some(1));
-        assert_eq!(scale_from_resources("Xft.dpi:\t120\n"), Some(1));
-        assert_eq!(scale_from_resources("Xft.dpi:\t144\n"), Some(2));
-        assert_eq!(scale_from_resources("Xft.dpi:\t168\n"), Some(2));
-        // Nothing to read: leave GTK's own value alone.
+        assert_eq!(scale_from_resources("Xcursor.size:\t24\nXft.dpi:\t192\n"), Some(2.0));
+        assert_eq!(scale_from_resources("Xft.dpi:\t96\n"), Some(1.0));
+        // A laptop at 150% or 135%: kept fractional, the page draws at just that.
+        assert_eq!(scale_from_resources("Xft.dpi:\t144\n"), Some(1.5));
+        assert!((scale_from_resources("Xft.dpi:\t129.6\n").unwrap() - 1.35).abs() < 1e-9);
+        // Nothing to read, or nonsense: leave GTK's own value alone.
         assert_eq!(scale_from_resources(""), None);
         assert_eq!(scale_from_resources("Xcursor.size:\t24\n"), None);
+        assert_eq!(scale_from_resources("Xft.dpi:\t0\n"), None);
+    }
+
+    #[test]
+    fn gtk_takes_the_whole_part_and_the_dpi_the_rest() {
+        // GDK_SCALE × GDK_DPI_SCALE × Xft.dpi/96 is what the page draws at:
+        // always the X server's scale itself.
+        assert_eq!(gdk_split(2.0), (2, "0.500000".into()));
+        assert_eq!(gdk_split(1.0), (1, "1.000000".into()));
+        assert_eq!(gdk_split(1.35), (1, "1.000000".into()));
+        assert_eq!(gdk_split(1.5), (2, "0.500000".into()));
+        assert_eq!(gdk_split(2.5), (3, "0.333333".into()));
+        for xscale in [1.0, 1.35, 1.5, 2.0, 2.5] {
+            let (gdk, dpi) = gdk_split(xscale);
+            let drawn = gdk as f64 * dpi.parse::<f64>().unwrap() * xscale;
+            assert!((drawn - xscale).abs() < 1e-5, "{xscale}: {drawn}");
+        }
     }
 }

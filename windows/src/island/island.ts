@@ -231,6 +231,18 @@ export class Island {
 
     this.root.append(this.wakeStrip, this.islandEl);
     this.applyGeometry();
+
+    // One log line per window size the page sees, so a wrong display scale
+    // (the panel is 720×320 CSS px whatever the screen) shows up in coucou.log.
+    const sizesSeen = new Set<string>();
+    const logViewport = () => {
+      const key = `${window.innerWidth}x${window.innerHeight}`;
+      if (sizesSeen.has(key)) return;
+      sizesSeen.add(key);
+      void Bridge.log(`window ${key} css px, drawn at ${window.devicePixelRatio.toFixed(2)}x`);
+    };
+    window.addEventListener("resize", logViewport);
+    logViewport();
   }
 
   // ── FSM ─────────────────────────────────────────────────────────────────────

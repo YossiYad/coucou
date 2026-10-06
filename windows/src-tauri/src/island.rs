@@ -50,6 +50,32 @@ fn dragged_screen(app: &AppHandle) -> String {
 }
 
 
+/// X pixels per CSS pixel of the island: what the webview actually draws at.
+/// On Linux under XWayland that is the X server's scale (see linux.rs), which
+/// GTK's whole-number scale factor only approximates; elsewhere the two agree.
+fn ui_scale(fallback: f64) -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::ui_scale().unwrap_or(fallback)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        fallback
+    }
+}
+
+/// A size in CSS pixels as the logical pixels Tauri sizes a window in.
+pub fn css_to_window(v: f64) -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::css_to_gtk(v)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        v
+    }
+}
+
 /// Margin around the island that still counts as "on the island", in logical px.
 /// Wider than the macOS 6 pt because a click must never be swallowed.
 const HIT_MARGIN: f64 = 14.0;
@@ -231,7 +257,7 @@ fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
 pub fn screen_info(app: &AppHandle, pref: &str) -> ScreenInfo {
     match target_monitor(app, pref) {
         Some(m) => {
-            let scale = m.scale_factor();
+            let scale = ui_scale(m.scale_factor());
             let p = m.position();
             let s = m.size();
             ScreenInfo {
@@ -251,7 +277,7 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let Some(win) = window(app) else { return };
     let Some(m) = target_monitor(app, pref) else { return };
 
-    let scale = m.scale_factor();
+    let scale = ui_scale(m.scale_factor());
     let mp = *m.position();
     let ms = *m.size();
 
@@ -506,6 +532,11 @@ pub fn update_input_region(app: &AppHandle, gate: &PollGate) {
         use gtk::cairo::{RectangleInt, Region};
         use gtk::prelude::*;
         let Ok(gtk_win) = win.gtk_window() else { return };
+        // The shape is in GTK's logical pixels; the island measures itself in
+        // CSS pixels, which are the same thing only when the page draws at
+        // GTK's own scale factor (see linux.rs).
+        let gtk_scale = gtk_win.scale_factor().max(1) as f64;
+        let px = |css: f64| css * ui_scale(gtk_scale) / gtk_scale;
         let region = if crate::linux_dnd::REPICK.load(Ordering::Relaxed) {
             // A drag just arrived: step out from under it so KWin picks us again
             // (see linux_dnd.rs).
@@ -514,12 +545,12 @@ pub fn update_input_region(app: &AppHandle, gate: &PollGate) {
             // Only the wake strip, even if the window manager kept the window
             // larger than asked: an invisible block at the top of the screen
             // swallowing clicks is the one thing this must never be.
-            Region::create_rectangle(&RectangleInt::new(0, 0, STRIP_W as i32, STRIP_H as i32))
+            Region::create_rectangle(&RectangleInt::new(0, 0, px(STRIP_W).ceil() as i32, px(STRIP_H).ceil() as i32))
         } else if r.w > 0.0 {
-            let x = (r.x - HIT_MARGIN).max(0.0).floor() as i32;
-            let y = (r.y - HIT_MARGIN).max(0.0).floor() as i32;
-            let right = (r.x + r.w + HIT_MARGIN).min(PANEL_W).ceil() as i32;
-            let bottom = (r.y + r.h + HIT_MARGIN).min(PANEL_H).ceil() as i32;
+            let x = px((r.x - HIT_MARGIN).max(0.0)).floor() as i32;
+            let y = px((r.y - HIT_MARGIN).max(0.0)).floor() as i32;
+            let right = px((r.x + r.w + HIT_MARGIN).min(PANEL_W)).ceil() as i32;
+            let bottom = px((r.y + r.h + HIT_MARGIN).min(PANEL_H)).ceil() as i32;
             Region::create_rectangle(&RectangleInt::new(x, y, (right - x).max(1), (bottom - y).max(1)))
         } else {
             // Nothing on screen yet: take no clicks at all (GTK has no truly
