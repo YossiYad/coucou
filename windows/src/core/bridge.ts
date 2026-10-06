@@ -22,8 +22,9 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T |
 
 export interface BootInfo {
   settings: Settings;
-  /** Logical screen rect of the monitor the island lives on. */
-  screen: { x: number; y: number; width: number; height: number; scale: number };
+  /** Logical screen rect of the monitor the island lives on, and what a drag
+   *  position from the toolkit is multiplied by to be in CSS px. */
+  screen: { x: number; y: number; width: number; height: number; scale: number; dragScale: number };
   version: string;
   hookPath: string;
   /** "windows" or "linux". */

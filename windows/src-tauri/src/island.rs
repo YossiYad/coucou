@@ -94,6 +94,11 @@ pub struct ScreenInfo {
     pub width: f64,
     pub height: f64,
     pub scale: f64,
+    /// What a drag position from the toolkit is multiplied by to land in CSS
+    /// pixels: on Linux GTK reports drags in its own logical pixels, which are
+    /// CSS pixels only when the page draws at GTK's scale factor (see linux.rs).
+    #[serde(rename = "dragScale")]
+    pub drag_scale: f64,
 }
 
 /// The island shape in window-logical coordinates, pushed by the front end.
@@ -266,14 +271,24 @@ pub fn screen_info(app: &AppHandle, pref: &str) -> ScreenInfo {
                 width: s.width as f64 / scale,
                 height: s.height as f64 / scale,
                 scale,
+                drag_scale: if cfg!(target_os = "linux") { m.scale_factor() / scale } else { 1.0 },
             }
         }
-        None => ScreenInfo { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0, scale: 1.0 },
+        None => ScreenInfo { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0, scale: 1.0, drag_scale: 1.0 },
     }
 }
 
 /// Places and sizes the window. `collapsed` picks the wake strip instead of the panel.
 pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
+    place(app, pref, collapsed, true);
+}
+
+/// `apply_geometry`, checking a moment later that the window really took the
+/// size and asking once more if not: at launch the first configure can land
+/// after the resize and put the window back to the 240×6 of the config (GTK
+/// then holds it at its natural 240×28), and the island would open into a
+/// strip nobody can see.
+fn place(app: &AppHandle, pref: &str, collapsed: bool, verify: bool) {
     let Some(win) = window(app) else { return };
     let Some(m) = target_monitor(app, pref) else { return };
 
@@ -299,6 +314,28 @@ pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     // Moving across displays can rescale the window: re-assert the physical size.
     let _ = win.set_size(PhysicalSize::new(pw, ph));
     let _ = win.set_always_on_top(true);
+
+    if !verify {
+        return;
+    }
+    let app = app.clone();
+    let pref = pref.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        let Some(win) = window(&app) else { return };
+        let Ok(size) = win.inner_size() else { return };
+        let still_wanted = app
+            .try_state::<crate::Shared>()
+            .map(|s| s.gate.collapsed.load(Ordering::Relaxed) == collapsed)
+            .unwrap_or(true);
+        if still_wanted && (size.width != pw || size.height != ph) {
+            crate::log::line(format!(
+                "window stayed {}x{} after asking for {pw}x{ph} (collapsed={collapsed}), asking again",
+                size.width, size.height
+            ));
+            place(&app, &pref, collapsed, false);
+        }
+    });
 }
 
 #[cfg(windows)]
@@ -337,18 +374,26 @@ pub fn set_activating(win: &WebviewWindow, activating: bool) {
     }
 }
 
-/// Position, size and scale of the monitor the island lives on. Any change here
-/// means the island has to be placed again.
-fn current_screen_key(app: &AppHandle) -> Option<(i32, i32, u32, u32, u64)> {
-    let pref = app
-        .try_state::<crate::Shared>()
-        .map(|s| s.settings.lock().unwrap().screen.clone())
-        .unwrap_or_else(|| "primary".into());
-    let m = target_monitor(app, &pref)?;
-    let p = m.position();
-    let size = m.size();
-    Some((p.x, p.y, size.width, size.height, m.scale_factor().to_bits()))
+/// Position, size and scale of every monitor, in a fixed order. Any change here
+/// means the layout moved and the island has to be placed again. The island's
+/// own monitor would not do: set to follow the cursor, it changes on every
+/// crossing, and the open island would be dragged along to the other screen.
+fn current_screen_key(app: &AppHandle) -> Option<ScreenKey> {
+    let mut key: ScreenKey = app
+        .available_monitors()
+        .ok()?
+        .iter()
+        .map(|m| {
+            let p = m.position();
+            let size = m.size();
+            (p.x, p.y, size.width, size.height, m.scale_factor().to_bits())
+        })
+        .collect();
+    key.sort_unstable();
+    (!key.is_empty()).then_some(key)
 }
+
+type ScreenKey = Vec<(i32, i32, u32, u32, u64)>;
 
 /// Emits `cursor` (window-logical coordinates) at ~60 Hz while the island is
 /// visible. Parked on a condvar the rest of the time.
@@ -358,7 +403,7 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
         let mut was_down = false;
         // Remembered across wakes so a display change while hidden is noticed the
         // moment the island comes back.
-        let mut last_screen: Option<(i32, i32, u32, u32, u64)> = None;
+        let mut last_screen: Option<ScreenKey> = None;
         loop {
             gate.wait_until_active();
             let mut last = (f64::MIN, f64::MIN);
@@ -567,7 +612,7 @@ pub fn update_input_region(app: &AppHandle, gate: &PollGate) {
 #[cfg(target_os = "linux")]
 pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
     std::thread::spawn(move || {
-        let mut last_screen: Option<(i32, i32, u32, u32, u64)> = None;
+        let mut last_screen: Option<ScreenKey> = None;
         // Ticks left before acting on a layout change: XWayland's new scale can
         // land a moment after the monitors do, so settle first.
         let mut settle: u32 = 0;
@@ -628,6 +673,8 @@ pub fn snap_target(monitors: &[(String, i32, i32, u32, u32)], cx: f64, cy: f64) 
 
 static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAST_MOVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Counts drags, so a timer left over from one never snaps the next.
+static DRAG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The user started dragging the island: the window manager moves it, and
 /// when the mouse button is let go it goes to the top centre of that screen. Snapping on
@@ -635,16 +682,18 @@ static LAST_MOVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// island then stayed wherever it was dropped.
 pub fn start_drag(app: &AppHandle) {
     let Some(win) = window(app) else { return };
+    let generation = DRAG_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     DRAGGING.store(true, Ordering::SeqCst);
     BUTTON_WATCH.store(false, Ordering::SeqCst);
     let _ = win.start_dragging();
     #[cfg(target_os = "linux")]
     watch_release(app, &win);
     // A drag the window manager refused never moves anything: stop waiting.
+    // Only for this drag, though: a later one has its own timers.
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(20));
-        if DRAGGING.swap(false, Ordering::SeqCst) {
+        if DRAG_GEN.load(Ordering::SeqCst) == generation && DRAGGING.swap(false, Ordering::SeqCst) {
             snap(&app);
         }
     });
@@ -711,10 +760,14 @@ pub fn moved(app: &AppHandle) {
         return;
     }
     let stamp = LAST_MOVE.fetch_add(1, Ordering::SeqCst) + 1;
+    let generation = DRAG_GEN.load(Ordering::SeqCst);
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(1500));
-        if LAST_MOVE.load(Ordering::SeqCst) == stamp && DRAGGING.swap(false, Ordering::SeqCst) {
+        if LAST_MOVE.load(Ordering::SeqCst) == stamp
+            && DRAG_GEN.load(Ordering::SeqCst) == generation
+            && DRAGGING.swap(false, Ordering::SeqCst)
+        {
             snap(&app);
         }
     });

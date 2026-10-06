@@ -368,8 +368,9 @@ function handleHook(island: Island, payload: HookPayload) {
         State.setPillBadge(CLAUDE_ID, "approval");
         island.reveal();
       }
-      // Coucou answers within 108 s or not at all; after that the terminal has
-      // taken over and the card would be lying.
+      // The relay drops the request 108 s after its ack; the card goes first,
+      // or a click in the last moments would play the sound, clear the card
+      // and deliver nothing, while the terminal is the one really asking.
       pendingTimeout = window.setTimeout(() => {
         pendingTimeout = null;
         if (!State.pendingApproval) return;
@@ -381,7 +382,7 @@ function handleHook(island: Island, payload: HookPayload) {
         if (State.work?.panel?.hookRequestId) State.work.panel.hookRequestId = undefined;
         if (State.view === "approval") island.setView(State.defaultView());
         State.notify();
-      }, 110_000);
+      }, 106_000);
       break;
     }
 

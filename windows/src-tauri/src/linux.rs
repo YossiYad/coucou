@@ -27,6 +27,7 @@ fn env_f64(name: &str) -> Option<f64> {
 /// Must run before Tauri (and so GTK) starts, while the process is still
 /// single-threaded.
 pub fn prepare_env() {
+    wait_for_predecessor();
     let mut own = Vec::new();
     let unset = |name: &str| std::env::var_os(name).map(|v| v.is_empty()).unwrap_or(true);
 
@@ -187,16 +188,43 @@ pub fn relaunch_if_scale_changed() -> bool {
         cmd.env_remove(var);
     }
     clean_env(&mut cmd);
+    // The replacement waits for this process to be gone before it claims the
+    // single instance (see `wait_for_predecessor`), so go right away: two of us
+    // alive at once would make the new one bow out and leave nothing running.
+    cmd.env(REPLACES_PID, std::process::id().to_string());
     if cmd.spawn().is_err() {
         crate::log::line("restart for new scale failed; staying up at the old one");
         return false;
     }
-    // Give the replacement a moment to come up before this one goes.
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        std::process::exit(0);
-    });
-    true
+    std::process::exit(0);
+}
+
+/// Set on a relaunched process: the pid of the one it replaces.
+const REPLACES_PID: &str = "COUCOU_REPLACES_PID";
+
+/// A relaunch (see `relaunch_if_scale_changed`) must not meet its predecessor's
+/// single-instance claim, which the plugin answers by quitting the newcomer.
+/// So wait for the old process to be gone first, a few seconds at most.
+fn wait_for_predecessor() {
+    let Some(pid) = std::env::var(REPLACES_PID).ok().and_then(|p| p.parse::<u32>().ok()) else {
+        return;
+    };
+    std::env::remove_var(REPLACES_PID);
+    let started = std::time::Instant::now();
+    while process_alive(pid) && started.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Whether `pid` is still running (a zombie waiting to be reaped is not).
+fn process_alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map(|stat| stat_says_alive(&stat)).unwrap_or(false)
+}
+
+/// Reads a /proc/<pid>/stat line: "pid (name) S ..."; the state letter follows
+/// the parenthesised name, which may itself hold spaces and parentheses.
+fn stat_says_alive(stat: &str) -> bool {
+    stat.rsplit_once(')').map(|(_, rest)| !rest.trim_start().starts_with('Z')).unwrap_or(false)
 }
 
 /// The tray icon goes through libayatana-appindicator (or the older
@@ -236,7 +264,15 @@ pub fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gdk_split, scale_from_resources};
+    use super::{gdk_split, scale_from_resources, stat_says_alive};
+
+    #[test]
+    fn a_zombie_predecessor_counts_as_gone() {
+        assert!(stat_says_alive("4141 (coucou) S 1 4141 4141 0 -1 4194560"));
+        assert!(stat_says_alive("4141 (co (u) cou) R 1 4141"));
+        assert!(!stat_says_alive("4141 (coucou) Z 1 4141 4141"));
+        assert!(!stat_says_alive(""));
+    }
 
     #[test]
     fn the_scale_comes_from_xft_dpi() {

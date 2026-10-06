@@ -201,9 +201,21 @@ fn settings_path() -> PathBuf {
 }
 
 pub fn load() -> Settings {
-    match std::fs::read(settings_path()) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => Settings::default(),
+    let path = settings_path();
+    let Ok(bytes) = std::fs::read(&path) else { return Settings::default() };
+    match serde_json::from_slice(&bytes) {
+        Ok(settings) => settings,
+        Err(err) => {
+            // Starting from defaults is the only option, but the file is the
+            // user's: set it aside, say so, and never silently save over it.
+            let kept = path.with_extension("json.bad");
+            let _ = std::fs::rename(&path, &kept);
+            crate::log::line(format!(
+                "settings.json could not be read ({err}); kept as {} and starting from defaults",
+                kept.display()
+            ));
+            Settings::default()
+        }
     }
 }
 
@@ -212,5 +224,10 @@ pub fn save(settings: &Settings) -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let json = serde_json::to_vec_pretty(settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(settings_path(), json)
+    // Written whole or not at all: a save cut short (power, a kill) must not
+    // leave an empty file that reads as "everything back to defaults".
+    let path = settings_path();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)
 }

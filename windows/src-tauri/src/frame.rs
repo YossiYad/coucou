@@ -22,7 +22,7 @@ fn label(i: usize) -> String {
     format!("{LABEL}-{i}")
 }
 
-fn page_url(app: &AppHandle) -> WebviewUrl {
+fn page_url<R: Runtime>(app: &AppHandle<R>) -> WebviewUrl {
     #[cfg(dev)]
     if let Some(mut base) = app.config().build.dev_url.clone() {
         base.set_path("/frame.html");
@@ -37,22 +37,7 @@ fn page_url(app: &AppHandle) -> WebviewUrl {
 pub fn create(app: &AppHandle) {
     let count = app.available_monitors().map(|m| m.len()).unwrap_or(1).max(1);
     for i in 0..count {
-        let built = WebviewWindowBuilder::new(app, label(i), page_url(app))
-            .title("Coucou can see this screen")
-            .decorations(false)
-            .transparent(true)
-            .shadow(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .focused(false)
-            .resizable(true)
-            .visible(false)
-            .build();
-        // Clicks are let through once it is shown: before that GTK has no
-        // window to set it on, and tao panics.
-        if let Err(err) = built {
-            crate::log::line(format!("frame window failed: {err}"));
-        }
+        build(app, i);
     }
     let handle = app.clone();
     tauri::async_runtime::spawn(async move { follow(handle).await });
@@ -95,8 +80,36 @@ fn active_output() -> Option<String> {
     None
 }
 
+/// The hidden frame window for monitor `i`.
+fn build<R: Runtime>(app: &AppHandle<R>, i: usize) {
+    let built = WebviewWindowBuilder::new(app, label(i), page_url(app))
+        .title("Coucou can see this screen")
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .resizable(true)
+        .visible(false)
+        .build();
+    // Clicks are let through once it is shown: before that GTK has no
+    // window to set it on, and tao panics.
+    if let Err(err) = built {
+        crate::log::line(format!("frame window failed: {err}"));
+    }
+}
+
 /// Frames exactly `monitors`, hides the rest.
 fn show_on<R: Runtime>(app: &AppHandle<R>, monitors: &[Monitor]) {
+    // A monitor plugged in since launch has no window yet: it gets one now,
+    // or it would be the one screen shared without the frame saying so.
+    for i in 0..monitors.len() {
+        if app.get_webview_window(&label(i)).is_none() {
+            crate::log::line(format!("frame window for a new screen ({i})"));
+            build(app, i);
+        }
+    }
     let mut i = 0;
     while let Some(win) = app.get_webview_window(&label(i)) {
         match monitors.get(i) {

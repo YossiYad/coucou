@@ -72,6 +72,8 @@ export class Island {
   private wasInIsland = false;
   /** The cursor comes from DOM events rather than Rust (see `useDomCursor`). */
   private domCursor = false;
+  /** Drag positions from the toolkit, times this, are CSS px (see `useDomCursor`). */
+  private dragScale = 1;
   /** Last shape handed to Rust for the click-through test. */
   private pushedRect = { x: -1, y: -1, w: -1, h: -1 };
   private homeCollapseAt: number | null = null;
@@ -154,7 +156,7 @@ export class Island {
         void Bridge.approvalDecision(req.requestId, d);
         State.pendingApproval = null;
         State.isPinned = false;
-        this.fsm.pinned = false;
+        this.dropPin();
         State.updateTask("integration_claude", "working");
         State.setPillBadge("integration_claude", null);
         this.setView(State.defaultView());
@@ -370,6 +372,9 @@ export class Island {
   /** An alert stopped waiting for an answer: let the island auto-close again. */
   dropPin() {
     this.fsm.pinned = false;
+    // While pinned, the mouse leaving armed no auto-close; if it is elsewhere
+    // now, arm it, or an answered or expired card would stay open for good.
+    if (!this.wasInIsland) this.fsm.mouseLeft();
   }
 
   // ── File drop ───────────────────────────────────────────────────────────────
@@ -378,10 +383,11 @@ export class Island {
     if (e.type !== "over") void Bridge.log(`drag ${e.type} ${e.paths?.length ?? 0} file(s)`);
     // On Linux nothing else reports the cursor during a drag; GTK does send it
     // with every drag event. Tauri labels it physical, but GTK's coordinates
-    // are already logical, so dividing by the scale halves them on HiDPI.
+    // are its own logical ones: CSS px on a whole-number scale, off by the
+    // fractional part otherwise, which `dragScale` makes up for.
     if (this.domCursor && e.position && e.type !== "leave") {
       this.pointerOutside = false;
-      this.onCursor(e.position.x, e.position.y);
+      this.onCursor(e.position.x * this.dragScale, e.position.y * this.dragScale);
     }
     if (State.paused) return;
     if (this.dragLeaveTimer != null) {
@@ -591,8 +597,10 @@ export class Island {
         this.collapsed = true;
         void Bridge.setCollapsed(true);
       }, 420);
-    } else if (this.collapsed) {
-      // Grow the window back before the island animates open.
+    } else if (this.collapsed || window.innerWidth < PANEL_W) {
+      // Grow the window back before the island animates open. Also when the
+      // window is a strip we never asked for: the launch resize can be lost
+      // to the first configure, and the island would open into 240×6.
       this.collapsed = false;
       void Bridge.setCollapsed(false);
     }
@@ -663,7 +671,8 @@ export class Island {
    * island there (an input region set from `setIslandRect`), so leaving the
    * window is leaving the island.
    */
-  useDomCursor() {
+  useDomCursor(dragScale = 1) {
+    this.dragScale = dragScale > 0 ? dragScale : 1;
     if (this.domCursor) return;
     this.domCursor = true;
     window.addEventListener("mousemove", (e) => {
