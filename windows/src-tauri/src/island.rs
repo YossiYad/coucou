@@ -351,7 +351,7 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                         let first = last_screen.is_none();
                         last_screen = now;
                         if !first {
-                            crate::log::line("display layout changed — repositioning".to_string());
+                            crate::log::line("display layout changed, repositioning".to_string());
                             let _ = app.emit_to(WINDOW_LABEL, "screen-changed", ());
                         }
                     }
@@ -537,6 +537,9 @@ pub fn update_input_region(app: &AppHandle, gate: &PollGate) {
 pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
     std::thread::spawn(move || {
         let mut last_screen: Option<(i32, i32, u32, u32, u64)> = None;
+        // Ticks left before acting on a layout change: XWayland's new scale can
+        // land a moment after the monitors do, so settle first.
+        let mut settle: u32 = 0;
         loop {
             gate.wait_until_active();
             while gate.is_active() {
@@ -546,13 +549,36 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
                     let first = last_screen.is_none();
                     last_screen = now;
                     if !first {
-                        crate::log::line("display layout changed — repositioning");
+                        crate::log::line("display layout changed, repositioning");
                         let _ = app.emit_to(WINDOW_LABEL, "screen-changed", ());
+                        settle = 3;
+                    }
+                }
+                // Once the layout has settled, a changed XWayland scale means
+                // GDK_SCALE no longer fits; relaunch picks up the new one (it is
+                // fixed for the life of a process). No-op on Windows.
+                if settle > 0 {
+                    settle -= 1;
+                    if settle == 0 && relaunch_if_scale_changed() {
+                        return;
                     }
                 }
             }
         }
     });
+}
+
+/// Relaunches Coucou when XWayland's scale has changed, so GDK_SCALE matches
+/// again; true when a relaunch was started. Only ever does anything on Linux.
+fn relaunch_if_scale_changed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::relaunch_if_scale_changed()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// The screen a dragged island lands on: the one its centre is over, or the
